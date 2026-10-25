@@ -231,6 +231,17 @@ class Config():
         if self.feature_gradient_count not in (0, 2, 4, 8, 24):
             raise ValueError("feature_gradient_count must be 0, 2, 4, 8 or 24")
 
+        ### ---------- tile cnn configs ---------- ###
+        self.material_cnn_enable = params.material_cnn_enable
+        if self.material_cnn_enable:
+            if self.feature_gradient_count != 4 or not params.mip0_only:
+                raise ValueError('Material CNN requires Mip0 and feature_gradient_count: 4')
+            if params.mode == 'train' and not params.multi_stage_training_enable:
+                raise ValueError('Material CNN training requires multi_stage_training_enable: true')
+        self.material_cnn_steps = params.material_cnn_steps
+        if self.material_cnn_steps < 1:
+            raise ValueError('material_cnn_steps must be positive')
+
         ### ---------- trainer configs ---------- ###
         self.multi_stage_training_enable = bool(params.multi_stage_training_enable)
         self.multi_stage_training_decoder_steps = int(params.multi_stage_training_decoder_steps)
@@ -545,6 +556,13 @@ def get_args():
     group.add_argument('--feature_gradient_count', type=int, choices=[0, 2, 4, 8, 24], default=0,
                        help='feature differences: 0 off, 2 right/down, 4 axial, 8 3x3, 24 5x5; '
                             'multi-stage training applies them during decoder fitting')
+
+    ### ---------- tile cnn configs ---------- ###
+    group = parser.add_argument_group("tile cnn configs")
+    group.add_argument('--material_cnn_enable', action=argparse.BooleanOptionalAction, default=False,
+                       help='fit material CNN after layout_refit in multi-stage training, or load it for inference')
+    group.add_argument('--material_cnn_steps', type=int, default=50000,
+                       help='material CNN fitting steps after four-gradient decoder/layout stages')
 
     ### ---------- trainer configs ---------- ###
     parser.add_argument('--multi_stage_training_enable', action=argparse.BooleanOptionalAction, default=True,

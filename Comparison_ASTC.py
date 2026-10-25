@@ -305,6 +305,8 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
         hwc[:, :, :3] = direct.squeeze(0).permute(1, 2, 0).to(hwc.dtype)
     hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
     image = hwc.permute(2, 0, 1)[None, ...]
+    if model.material_cnn is not None:
+        image = model.material_cnn.tiled(image, inference_tile)
     return resize_bilinear_repeat(image, target_size) if (H, W) != target_size else image
 
 

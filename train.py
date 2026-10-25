@@ -7,6 +7,7 @@ import argparse
 import json
 import copy
 import math
+import time
 from typing import List, Optional, Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
@@ -21,6 +22,7 @@ import tinycudann as tcnn
 
 from configs import get_args, inference_mips, mip_sampling_probabilities
 from model import TCNNModel
+from Core.Tile_CNN.material_cnn import MaterialCNN
 from dataset import TextureDataset
 from Core.Material_Encoding.normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr, normal_vectors
 from configs import Config
@@ -566,6 +568,107 @@ class Trainer(ASTCAwareTrainer):
 
         self._complete_training_phase()
 
+    def fit_material_cnn(self, steps=50000, validation_interval=1000):
+        """Fit native material refinement on the frozen final ASTC decoder."""
+        if steps < 1:
+            raise ValueError('Material CNN steps must be positive')
+        if validation_interval < 1:
+            raise ValueError('Material CNN validation interval must be positive')
+        model = self.model
+        if not self.mip0_only or model.feature_gradient_count != 4 or model.material_cnn is not None:
+            raise ValueError('Material CNN fitting requires an unfiltered four-gradient Mip0 decoder')
+        native_h, native_w = material_size(model, self.texture_height, self.texture_width)
+        if self.texture_height % native_h or self.texture_width % native_w:
+            raise ValueError('Material CNN fitting requires an integer GT/native size ratio')
+        sy, sx = self.texture_height // native_h, self.texture_width // native_w
+        started = time.perf_counter()
+        with torch.no_grad():
+            decoded = copy.deepcopy(model).eval()
+            decoded.simulate_quantize()
+            apply_astc_to_feature_grids(decoded, self.astc_codec.roundtrip_rgba)
+            base = (cached_astc_base(self.dataset, self.astc_codec,
+                                    self.configs.super_resolution_base_resolution,
+                                    output_size=(native_h, native_w))
+                    if self.super_resolution_enable else None)
+            raw = _render_model_mip0(decoded, self.dataset, native_h, native_w,
+                                     self.num_mips, self.device,
+                                     superres_base_override=base, inference_tile=128)
+            del decoded
+        gt = self.dataset.expand_mip_to_canonical_level(
+            self.dataset.mip_cache[0]).permute(2, 0, 1)[None].float()
+        post = MaterialCNN(model.num_channels).to(self.device)
+        optimizer = torch.optim.Adam(post.parameters(), lr=.001)
+        weights = torch.tensor(self.output_loss_weights, device=self.device)
+        core, radius = 32, post.halo
+        # Extra ring covers the bilinear material upsampler.
+        axis = torch.arange(-radius-1, core+radius+1, device=self.device)
+        ty = torch.arange(core*sy, device=self.device)
+        tx = torch.arange(core*sx, device=self.device)
+        yy, xx = torch.meshgrid((ty+.5)/sy+1, (tx+.5)/sx+1, indexing='ij')
+        grid = torch.stack((2*xx/(core+2)-1, 2*yy/(core+2)-1), -1)
+
+        def positions(batch):
+            return torch.stack((torch.randint(native_h, (batch,), device=self.device),
+                                torch.randint(native_w, (batch,), device=self.device)), 1)
+
+        def loss_at(origins):
+            iy = (origins[:, 0, None]+axis) % native_h
+            ix = (origins[:, 1, None]+axis) % native_w
+            patches = raw[0, :, iy[:, :, None], ix[:, None, :]].permute(1, 0, 2, 3)
+            filtered = post.valid(patches)
+            prediction = F.grid_sample(filtered, grid[None].expand(len(origins), -1, -1, -1),
+                                       mode='bilinear', align_corners=False)
+            gy = (origins[:, 0, None]*sy+ty) % self.texture_height
+            gx = (origins[:, 1, None]*sx+tx) % self.texture_width
+            target = gt[0, :, gy[:, :, None], gx[:, None, :]].permute(1, 0, 2, 3)
+            prediction = prediction.permute(0, 2, 3, 1).reshape(-1, model.num_channels)
+            target = target.permute(0, 2, 3, 1).reshape(-1, model.num_channels)
+            loss = ((prediction-target).square().mean(0)*weights).sum()
+            if self.pbr_loss_enable and self.pbr_loss_weight > 0:
+                loss = loss+self.pbr_loss_weight*self._compute_pbr_render_loss(target, prediction)
+            return loss
+
+        validation = positions(16)
+        with torch.no_grad():
+            best = float(loss_at(validation))
+        if not math.isfinite(best):
+            raise RuntimeError('Nonfinite initial material CNN validation loss')
+        best_state, best_step = copy.deepcopy(post.state_dict()), 0
+        history = [dict(step=0, validation_loss=best)]
+        interval = min(validation_interval, steps)
+        for step in range(1, steps+1):
+            ratio = step/steps
+            lr = .001 if ratio <= .5 else (.0003 if ratio <= .8 else .0001)
+            optimizer.param_groups[0]['lr'] = lr
+            optimizer.zero_grad(set_to_none=True)
+            loss = loss_at(positions(4))
+            if not torch.isfinite(loss):
+                raise RuntimeError('Nonfinite material CNN training loss')
+            loss.backward()
+            optimizer.step()
+            self.writer.add_scalar('MaterialCNN/train_loss', float(loss.detach()), step)
+            if step % interval == 0 or step == steps:
+                with torch.no_grad():
+                    value = float(loss_at(validation))
+                if not math.isfinite(value):
+                    raise RuntimeError('Nonfinite material CNN validation loss')
+                if value < best:
+                    best, best_step = value, step
+                    best_state = copy.deepcopy(post.state_dict())
+                history.append(dict(step=step, validation_loss=value, best_step=best_step, lr=lr))
+                self.writer.add_scalar('MaterialCNN/validation_loss', value, step)
+                print(f'[Material CNN] {step}/{steps}: validation={value:.8f}, best={best_step}', flush=True)
+        post.load_state_dict(best_state)
+        if not all(torch.isfinite(p).all() for p in post.parameters()):
+            raise RuntimeError('Nonfinite material CNN parameters')
+        model.material_cnn = post.eval()
+        model.register_buffer('_material_cnn_version', torch.tensor(MaterialCNN.version, device=self.device))
+        return dict(steps=steps, best_step=best_step, best_validation_loss=best,
+                    native_size=[native_h, native_w],
+                    gt_size=[self.texture_height, self.texture_width],
+                    parameters=sum(p.numel() for p in post.parameters()),
+                    seconds=time.perf_counter()-started, history=history)
+
     def _cuda_trim_eval_mem(self, synchronize: bool = False) -> None:
         if self.device != "cuda":
             return
@@ -598,7 +701,8 @@ class Trainer(ASTCAwareTrainer):
     @torch.no_grad()
     def _fill_predicted_mip(self, mip: int, mip_height: int, mip_width: int) -> torch.Tensor:
         """Tiled full-plane forward (caps tcnn batch size; scatter by row/col to avoid layout bugs)."""
-        if mip == 0 and material_size(self.model, mip_height, mip_width) != (mip_height, mip_width):
+        if mip == 0 and (material_size(self.model, mip_height, mip_width) != (mip_height, mip_width)
+                         or self.model.material_cnn is not None):
             base = (self.astc_superres_base_mip0.permute(2, 0, 1)[None]
                     if self.super_resolution_enable and self.model._decoder_adaptation_features is not None else None)
             return _render_model_mip0(self.model, self.dataset, mip_height, mip_width, self.num_mips,

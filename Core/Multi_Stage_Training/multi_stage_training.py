@@ -116,7 +116,8 @@ def _record_stage(trainer, stages, name, start_iteration, details):
         "checkpoint": os.path.join(trainer.model_path, f"train_result_{iteration}", "model.pth"),
         "model": {"hidden_layers": model.n_hidden_layers, "neurons": model.n_neurons,
                   "pe_frequencies": model.n_frequencies,
-                  "feature_gradient_count": model.feature_gradient_count},
+                  "feature_gradient_count": model.feature_gradient_count,
+                  "material_cnn_enable": model.material_cnn is not None},
         "metrics": {"astc": astc, "pbr": pbr}, "details": details,
     }
     stages.append(record)
@@ -138,6 +139,7 @@ def run_multi_stage_training(params, config=None):
     representation_config.n_hidden_layers = 0
     representation_config.n_frequencies = 0
     representation_config.feature_gradient_count = 0
+    representation_config.material_cnn_enable = False
     trainer = Trainer(params, config_override=representation_config)
     stages = []
     try:
@@ -155,15 +157,18 @@ def run_multi_stage_training(params, config=None):
         target.pos_encoding_reference_edge = representation_config.pos_encoding_reference_edge
         if hasattr(representation_config, 'material_reconstruction_size'):
             target.material_reconstruction_size = representation_config.material_reconstruction_size
-        decoder = TCNNModel(target)
+        # Fit the spatial CNN only after normal decoder and layout training.
+        decoder_config = copy.deepcopy(target)
+        decoder_config.material_cnn_enable = False
+        decoder = TCNNModel(decoder_config)
         decoder.astc_proxy = copy.deepcopy(source.astc_proxy)
         decoder.astc_proxy.requires_grad_(False)
         with torch.no_grad():
             for old_grid, new_grid in zip(source.feature_grids, decoder.feature_grids):
                 new_grid.params.copy_(old_grid.params)
         decoder.current_iter = representation["end_iteration"]
-        trainer.model, trainer.configs = decoder, target
-        trainer._write_resolved_config(target)
+        trainer.model, trainer.configs = decoder, decoder_config
+        trainer._write_resolved_config(decoder_config)
         print(f"[Multi Stage Training] decoder: {target.n_hidden_layers} hidden layers, width {target.n_neurons}, "
               f"{target.n_frequencies} PE frequencies, {target.feature_gradient_count} feature differences", flush=True)
         start = decoder.current_iter + 1
@@ -181,6 +186,14 @@ def run_multi_stage_training(params, config=None):
         else:
             stages.append({"name": "layout_refit", "status": "skipped", "details": details})
             final = fitted
+        if target.material_cnn_enable:
+            print('[Multi Stage Training] material_cnn', flush=True)
+            start = decoder.current_iter + 1
+            details = trainer.fit_material_cnn(target.material_cnn_steps)
+            decoder.current_iter += details['steps']
+            trainer.configs.material_cnn_enable = True
+            trainer._write_resolved_config(trainer.configs)
+            final = _record_stage(trainer, stages, 'material_cnn', start, details)
         results = {"stages": stages, "final_iteration": final["end_iteration"],
                    "final_checkpoint": final["checkpoint"], "final_metrics": final["metrics"]}
         with open(os.path.join(trainer.save_path, "multi_stage_training.json"), "w", encoding="utf-8") as output:

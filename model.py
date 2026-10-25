@@ -10,6 +10,7 @@ from torchtyping import TensorType
 from configs import Config
 from Core.Positional_Encoding.positional_encoding import TiledPositionalEncoding
 from Core.Feature_Grid.feature_gradients import sample_feature_inputs
+from Core.Tile_CNN.material_cnn import MaterialCNN
 from Core.Feature_Grid.sampling import nearest_grid_uv
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -196,6 +197,12 @@ class TCNNModel(torch.nn.Module):
         }
         total_grid_features = sum(self.feature_grid_n_features_per_level) * self.num_sampled_mips
         total_grid_features *= 1 + self.feature_gradient_count
+        self.material_cnn = None
+        if getattr(config, 'material_cnn_enable', False):
+            if not self.mip0_only or self.feature_gradient_count != 4:
+                raise ValueError('Material CNN requires Mip0 four-gradient latent')
+            self.material_cnn = MaterialCNN(self.num_channels).to(self.device)
+            self.register_buffer('_material_cnn_version', torch.tensor(MaterialCNN.version, device=self.device))
         if self.direct_diffuse_enabled:
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
@@ -550,6 +557,10 @@ class TCNNModel(torch.nn.Module):
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         state_dict = copy.copy(state_dict)
+        if ('_material_cnn_version' in state_dict) != (self.material_cnn is not None):
+            raise ValueError('Checkpoint material CNN mode does not match model configuration')
+        if '_material_cnn_version' in state_dict and int(state_dict['_material_cnn_version']) != MaterialCNN.version:
+            raise ValueError('Unsupported material CNN checkpoint version')
         for index, spec in enumerate(self.feature_grid_specs):
             key = f'feature_grids.{index}.params'
             if self.mip0_only and spec.n_levels == 1 and key in state_dict:
@@ -603,6 +614,8 @@ class TCNNModel(torch.nn.Module):
             }
 
             network_data_path = os.path.join(save_path, f"network_data.npz")
+            if save_model.material_cnn is not None:
+                save_kwargs.update(save_model.material_cnn.export_arrays())
             # Save parameters to npz (features moved to DDS files)
             np.savez(network_data_path, **save_kwargs)
             for i, codec in enumerate(save_model.astc_proxy):

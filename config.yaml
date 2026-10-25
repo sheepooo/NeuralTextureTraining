@@ -33,6 +33,10 @@ feature_grid_configs:
 # ---------- feature gradient configs ----------
 feature_gradient_count: 4  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
 
+# ---------- tile cnn configs ----------
+material_cnn_enable: true  # train after representation -> decoder -> layout_refit; load for inference
+material_cnn_steps: 50000
+
 # ---------- super resolution configs ----------
 super_resolution_enable: true
 super_resolution_base_resolution: 512
