@@ -198,6 +198,7 @@ def run_multi_stage_training(params, config=None):
                    "final_checkpoint": final["checkpoint"], "final_metrics": final["metrics"]}
         with open(os.path.join(trainer.save_path, "multi_stage_training.json"), "w", encoding="utf-8") as output:
             json.dump(results, output, indent=2)
+        trainer.save_compressed_materials(trainer.media_path, final['end_iteration'])
         return results
     finally:
         trainer.writer.close()

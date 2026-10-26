@@ -1,7 +1,7 @@
 # ============================================================
 # FNTC Baseline Configuration
 # This file serves as the persistent default config for training.
-# Priority chain: argparse defaults -> config.yaml -> CLI args
+# Priority chain: argparse defaults -> selected YAML -> CLI args
 # ============================================================
 
 # ---------- quantization configs ----------
@@ -65,10 +65,14 @@ multi_stage_training_decoder_steps: 50000
 multi_stage_training_decoder_lr_multiplier: 1.0
 multi_stage_training_layout_refit_steps: 1000  # offline latent/layout pass; 0 disables
 
+# ---------- ASTC comparison configs ----------
+ref_astc_resolution: 1024
+
 # ---------- PBR scene comparison configs ----------
 enable_pbr_compare: true
 pbr_compare_interval: 5000
 pbr_render_resolution: 1024  # final cropped Cornell-box height per panel
+pbr_detail_resolution: 2048  # independent detail viewport, width and height
 pbr_detail_center: [0.5, 0.62]  # normalized x/y in the original square camera raster
 pbr_detail_zoom: 4.0  # separately render the focused viewport
 pbr_mip_lod_bias: 0.0  # use one sharper mip level

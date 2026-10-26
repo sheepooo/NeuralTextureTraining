@@ -2,7 +2,7 @@
 ASTC comparison pipeline: FNTC (quantized / grid-ASTC) vs traditional RGBA ASTC round-trip.
 
 Uses official astcenc for encode+decode baselines. Visualization and metrics align on Mip0
-full texture resolution; optional ref_astc_resolution (int square side) resamples only the traditional baseline path.
+full texture resolution; ref_astc_resolution sets the shared FNTC/ASTC material raster.
 """
 from __future__ import annotations
 
@@ -57,6 +57,13 @@ def _ref_astc_hw_from_side(side: Optional[int], base_h: int, base_w: int) -> Tup
         raise ValueError(f"ref_astc_resolution must be a positive int (square edge), got {side}")
     scale = float(side) / float(max(base_h, base_w))
     return max(1, int(round(base_h * scale))), max(1, int(round(base_w * scale)))
+
+
+
+def comparison_material_size(model, height: int, width: int, ref_astc_resolution=None):
+    """Shared FNTC/ASTC raster, independent of latent resolution when specified."""
+    edge = ref_astc_resolution or max(material_size(model, height, width))
+    return _ref_astc_hw_from_side(edge, height, width)
 
 
 # ---------------------------------------------------------------------------
@@ -261,13 +268,14 @@ def _render_gt_mip0(dataset, texture_height: int, texture_width: int) -> torch.T
 @torch.no_grad()
 def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, num_mips: int, device: str,
                        superres_base_override: Optional[torch.Tensor] = None,
-                       inference_tile: int = 512) -> torch.Tensor:
+                       inference_tile: int = 512,
+                       inference_size: Optional[Tuple[int, int]] = None) -> torch.Tensor:
     """Render Mip0 in tiles, bounding decoder and feature-gradient temporaries."""
     mip = 0
     H = texture_height >> mip
     W = texture_width >> mip
     target_size = (H, W)
-    H, W = material_size(model, H, W)
+    H, W = inference_size if inference_size is not None else material_size(model, H, W)
     native_base = None
     if getattr(model, 'super_resolution_enable', False) and (H, W) != target_size:
         native_base = (clean_base_image(dataset, (H, W)) if superres_base_override is None
@@ -751,14 +759,14 @@ def run_astc_comparison_pipeline(
             feature_resolutions.append(int(spec.highest_level_slice()[2]))
         except (AttributeError, TypeError, ValueError):
             pass
-    effective_ref_resolution = ref_astc_resolution or max(material_size(model, h0, w0))
-    ref_h, ref_w = _ref_astc_hw_from_side(effective_ref_resolution, h0, w0)
+    ref_h, ref_w = comparison_material_size(model, h0, w0, ref_astc_resolution)
     reference = comparison_reference(dataset, astc_codec, ref_h, ref_w)
     gt_image = reference['gt'].to(device)
-    native_h, native_w = material_size(model, h0, w0)
+    native_h, native_w = ref_h, ref_w
     with open(os.path.join(compare_root, 'reconstruction.json'), 'w', encoding='utf-8') as output:
         json.dump({'gt_size': [h0, w0], 'fntc_material_size': [native_h, native_w],
-                   'astc_material_size': [ref_h, ref_w], 'upsampler': 'bilinear_repeat',
+                   'astc_material_size': [ref_h, ref_w], 'feature_grid_resolutions': feature_resolutions,
+                   'upsampler': 'bilinear_repeat' if (ref_h, ref_w) != (h0, w0) else None,
                    'texture_packing': dataset.texture_packing,
                    'texel_centers': True, 'decoder_queries': native_h * native_w}, output, indent=2)
     if (ref_h, ref_w) != (h0, w0):
@@ -772,10 +780,10 @@ def run_astc_comparison_pipeline(
         astc_base = cached_astc_base(
             dataset, astc_codec,
             int(getattr(dataset, "super_resolution_base_resolution", dataset.superres_input_max_edge)),
-            output_size=material_size(quant_model, texture_height, texture_width))
+            output_size=(ref_h, ref_w))
     pred_fntc = _render_model_mip0(quant_model, dataset, texture_height, texture_width, num_mips, device,
                                   superres_base_override=astc_base if quant_model._decoder_adaptation_features is not None else None,
-                                  inference_tile=inference_tile)
+                                  inference_tile=inference_tile, inference_size=(ref_h, ref_w))
 
     astc_grid_model = copy.deepcopy(quant_model)
     apply_astc_to_feature_grids(astc_grid_model, astc_codec.roundtrip_rgba)
@@ -784,6 +792,7 @@ def run_astc_comparison_pipeline(
         astc_grid_model, dataset, texture_height, texture_width, num_mips, device,
         superres_base_override=astc_base,
         inference_tile=inference_tile,
+        inference_size=(ref_h, ref_w),
     )
 
     pred_traditional_astc = reference['astc'].to(device)

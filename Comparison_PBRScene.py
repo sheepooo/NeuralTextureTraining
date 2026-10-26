@@ -453,9 +453,12 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
                         lpips_metric=None, mip_lod_bias: float = -1.0,
                         lighting=None, detail_center=(0.5, 0.62), detail_zoom: float = 4.0,
                         reference_cache=None,
+                        detail_resolution: int = 2048,
                         ) -> Tuple[str, Dict[str, Tuple[float, float, float]]]:
     """Render FNTC-ASTC, traditional ASTC, and GT texture sets in one scene."""
     available = getattr(dataset, "available_textures", None)
+    if detail_resolution < 64:
+        raise ValueError('PBR detail resolution must be at least 64')
     if (not math.isfinite(detail_zoom) or detail_zoom <= 1 or len(detail_center) != 2
             or any(not math.isfinite(v) or not 0 <= v <= 1 for v in detail_center)):
         raise ValueError('Detail zoom must be finite and > 1; center must be two coordinates in [0,1]')
@@ -470,7 +473,7 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
     key = (tuple((id(t), t._version, tuple(t.shape)) for t in sources),
            tuple((name, tuple(bounds)) for name, bounds in dataset.canonical_channel_slices.items()),
            dataset.normal_encoding, None if available is None else tuple(available),
-           resolution, mip_lod_bias, json.dumps(lighting, sort_keys=True), tuple(detail_center), detail_zoom)
+           resolution, detail_resolution, mip_lod_bias, json.dumps(lighting, sort_keys=True), tuple(detail_center), detail_zoom)
     if cache.get('key') != key:
         cache.clear()
         cache.update(key=key, sources=sources, metrics={})
@@ -518,11 +521,11 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
     # A fresh narrow viewport changes rasterization and UV derivatives/LOD.
     # These are new samples and shading evaluations, never resized full-frame crops.
     detail_fntc = render_pbr_scene(fntc_astc_texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-                                 int(resolution), available, mip_lod_bias, lighting,
+                                 int(detail_resolution), available, mip_lod_bias, lighting,
                                  view_center=detail_center, view_zoom=detail_zoom)
     if 'detail' not in cache:
         cache['detail'] = [render_pbr_scene(texture, dataset.canonical_channel_slices, dataset.normal_encoding,
-                                          int(resolution), available, mip_lod_bias, lighting,
+                                          int(detail_resolution), available, mip_lod_bias, lighting,
                                           view_center=detail_center, view_zoom=detail_zoom)
                            for texture in (traditional_astc_texture, gt_texture)]
     detail = [detail_fntc, *cache['detail']]
@@ -537,6 +540,6 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
     with open(os.path.join(out_dir, 'metrics.json'), 'w', encoding='utf-8') as output:
         json.dump({'full': metrics, 'detail': detail_metrics,
                    'detail_view': {'center': list(detail_center), 'zoom': detail_zoom,
-                                   'resolution': int(resolution), 'rendered_separately': True}},
+                                   'resolution': int(detail_resolution), 'rendered_separately': True}},
                   output, indent=2)
     return path, metrics

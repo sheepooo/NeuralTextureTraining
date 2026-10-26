@@ -295,6 +295,8 @@ ASTC 对比继续复用项目已有的 `astcenc_path`、`astcenc_quality` 和 `a
 
 ASTC 图片位于 `Compare_ASTC<block>/iter_<迭代>/`（如 `Compare_ASTC6x6/iter_00001000/`），`comparison_strip_<纹理>.png` 仅包含 FNTC-ASTC、ASTC 和 GT；四张独立图命名为 `<Type>_Uncompressed_FNTC.png`、`<Type>_FNTC_<block>.png`、`<Type>_ASTC_<block>.png`、`<Type>_GT.png`。所有图片直接放在迭代目录，未压缩 FNTC 仍保留在日志和独立图中，不再生成无指标拼图。PBR 的所有图片及 `metrics.json` 统一放在 `Compare_PBRScene/iter_<迭代>/`：`comparison_strip.png`、`comparison_strip_detail.png`、全景独立图 `Scene_FNTC_<block>.png`/`Scene_ASTC_<block>.png`/`Scene_GT.png`，以及带 `detail_` 前缀的特写独立图；未提供迭代号时直接放在 `Compare_PBRScene/`。特写按 `pbr_detail_center`（原始正方形画面中的归一化 x/y）及 `pbr_detail_zoom` 重新渲染，单独计算指标，全景日志口径不变。
 
+PBR 特写按 `pbr_detail_resolution` 独立渲染（默认 2048），全景高度由 `pbr_render_resolution` 控制。
+
 代理需要 CUDA 版 PyTorch、匹配的 CUDA toolkit、C++ 编译器和 ninja。它复用
 `tools/astc_encoder_source/Source`，源码缺失时下载固定版本到该目录。目前支持量化 Mip0、
 6x6 ASTC、四通道 feature grid，且 direct diffuse 必须关闭。材质投影还要求单 grid、无 PE 和 feature gradients 的仿射超分 decoder，也支持 GT 大于原生材质分辨率；其他单阶段配置应设置 `astc_decoder_projection_interval: 0`。
@@ -366,7 +368,7 @@ bias，并增加 `decoder_output_bias` 作为输出层 bias。残差超分模式
 
 材质重建采用最大 latent 分辨率（不超过 GT，保持宽高比）。1K latent＋512 SR base 对齐 2K GT 时，FNTC 先解码并 clamp 得到 1K 材质；FNTC 和默认 1K ASTC 基线再使用相同的 texel-center bilinear-repeat 放大到 2K。训练通过邻近四个**材质预测**可微插值，直接监督最终 2K 结果，不再在 2K 坐标直接调用 decoder。base 从原始低分辨率 mip 直接采样到 1K，避免 512→2K→1K 的重复插值。
 
-warmup、codec 目标及候选验收、冻结 decoder 拟合、布局重拟合、普通推理和 ASTC/PBR 评测复用同一重建路径。布局选择覆盖整倍数比例（如 1K→2K）下所有受影响的 GT 像素。跨分辨率训练当前要求 `mip0_only: true`；`ref_astc_resolution` 默认跟随 FNTC 材质边长，显式设置可覆盖基线尺寸。日志及 `reconstruction.json` 区分材质/GT 分辨率和原生 decoder 查询数。ASTC 输入及材质投影候选共用材质专用 mip 预滤波，包含法线向量处理。
+各训练阶段复用原生材质重建路径。普通推理和 ASTC/PBR 评测在 `ref_astc_resolution` 指定的共同尺寸生成 FNTC/ASTC 材质，仅尺寸不同于 GT 时才使用 bilinear-repeat 缩放到 GT。布局选择覆盖整倍数比例（如 1K→2K）下所有受影响的 GT 像素。跨分辨率训练当前要求 `mip0_only: true`；`ref_astc_resolution` 默认跟随 FNTC 材质边长，显式设置同时覆盖 FNTC 推理及 ASTC 基线尺寸，与 feature grid 分辨率独立；material CNN 在该推理尺寸上运行，再按需缩放到 GT。日志及 `reconstruction.json` 区分材质/GT 分辨率和原生 decoder 查询数。ASTC 输入及材质投影候选共用材质专用 mip 预滤波，包含法线向量处理。
 
 在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定
 `super_resolution_base_resolution` 可启用超分残差训练。该分辨率的原始纹理 mip 作为 base，

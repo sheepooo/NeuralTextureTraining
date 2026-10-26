@@ -6,6 +6,7 @@ import datetime
 import argparse
 import json
 import copy
+import contextlib
 import math
 import time
 from typing import List, Optional, Tuple
@@ -31,7 +32,7 @@ from Comparison_ASTC import (
     cached_astc_base,
     comparison_reference,
     _render_model_mip0,
-    _ref_astc_hw_from_side,
+    comparison_material_size,
     _compute_group_metrics,
     run_astc_comparison_pipeline,
 )
@@ -151,8 +152,11 @@ class Trainer(ASTCAwareTrainer):
         self.texture_width = dataset.texture_width
         self.mip0_only = bool(getattr(configs, "mip0_only", False))
         native_h, native_w = configs.material_reconstruction_size
-        print(f'[Material Reconstruction] decoder={native_w}x{native_h}, GT={self.texture_width}x{self.texture_height}, '
-              'upsampler=bilinear_repeat, texel_centers=True')
+        infer_h, infer_w = comparison_material_size(
+            model, self.texture_height, self.texture_width, configs.ref_astc_resolution)
+        print(f'[Material Reconstruction] training={native_w}x{native_h}, inference={infer_w}x{infer_h}, '
+              f'GT={self.texture_width}x{self.texture_height}, '
+              f'resize_to_gt={(infer_h, infer_w) != (self.texture_height, self.texture_width)}, texel_centers=True')
         self.subpixel_sampling_enable = bool(getattr(configs, "subpixel_sampling_enable", True))
         self.subpixel_sampling_ratio = float(getattr(configs, "subpixel_sampling_ratio", 0.25))
         self.subpixel_jitter = float(getattr(configs, "subpixel_jitter", 0.5))
@@ -434,6 +438,7 @@ class Trainer(ASTCAwareTrainer):
         if self.enable_pbr_compare:
             self.run_pbr_comparison(curr_iter=last_iter, output_root=self.media_path)
         self.model.save(last_iter, self.model_path)
+        self.save_compressed_materials(self.media_path, last_iter)
         self._log_checkpoint_interval(last_iter)
         self._log_total_training_time()
 
@@ -569,7 +574,7 @@ class Trainer(ASTCAwareTrainer):
         self._complete_training_phase()
 
     def fit_material_cnn(self, steps=50000, validation_interval=1000):
-        """Fit native material refinement on the frozen final ASTC decoder."""
+        """Fit material refinement at the deployed inference resolution."""
         if steps < 1:
             raise ValueError('Material CNN steps must be positive')
         if validation_interval < 1:
@@ -577,10 +582,11 @@ class Trainer(ASTCAwareTrainer):
         model = self.model
         if not self.mip0_only or model.feature_gradient_count != 4 or model.material_cnn is not None:
             raise ValueError('Material CNN fitting requires an unfiltered four-gradient Mip0 decoder')
-        native_h, native_w = material_size(model, self.texture_height, self.texture_width)
-        if self.texture_height % native_h or self.texture_width % native_w:
-            raise ValueError('Material CNN fitting requires an integer GT/native size ratio')
-        sy, sx = self.texture_height // native_h, self.texture_width // native_w
+        infer_h, infer_w = comparison_material_size(
+            model, self.texture_height, self.texture_width, self.ref_astc_resolution)
+        if self.texture_height % infer_h or self.texture_width % infer_w:
+            raise ValueError('Material CNN fitting requires an integer GT/inference size ratio')
+        sy, sx = self.texture_height // infer_h, self.texture_width // infer_w
         started = time.perf_counter()
         with torch.no_grad():
             decoded = copy.deepcopy(model).eval()
@@ -588,11 +594,12 @@ class Trainer(ASTCAwareTrainer):
             apply_astc_to_feature_grids(decoded, self.astc_codec.roundtrip_rgba)
             base = (cached_astc_base(self.dataset, self.astc_codec,
                                     self.configs.super_resolution_base_resolution,
-                                    output_size=(native_h, native_w))
+                                    output_size=(infer_h, infer_w))
                     if self.super_resolution_enable else None)
-            raw = _render_model_mip0(decoded, self.dataset, native_h, native_w,
+            raw = _render_model_mip0(decoded, self.dataset, infer_h, infer_w,
                                      self.num_mips, self.device,
-                                     superres_base_override=base, inference_tile=128)
+                                     superres_base_override=base, inference_tile=128,
+                                     inference_size=(infer_h, infer_w))
             del decoded
         gt = self.dataset.expand_mip_to_canonical_level(
             self.dataset.mip_cache[0]).permute(2, 0, 1)[None].float()
@@ -608,12 +615,12 @@ class Trainer(ASTCAwareTrainer):
         grid = torch.stack((2*xx/(core+2)-1, 2*yy/(core+2)-1), -1)
 
         def positions(batch):
-            return torch.stack((torch.randint(native_h, (batch,), device=self.device),
-                                torch.randint(native_w, (batch,), device=self.device)), 1)
+            return torch.stack((torch.randint(infer_h, (batch,), device=self.device),
+                                torch.randint(infer_w, (batch,), device=self.device)), 1)
 
         def loss_at(origins):
-            iy = (origins[:, 0, None]+axis) % native_h
-            ix = (origins[:, 1, None]+axis) % native_w
+            iy = (origins[:, 0, None]+axis) % infer_h
+            ix = (origins[:, 1, None]+axis) % infer_w
             patches = raw[0, :, iy[:, :, None], ix[:, None, :]].permute(1, 0, 2, 3)
             filtered = post.valid(patches)
             prediction = F.grid_sample(filtered, grid[None].expand(len(origins), -1, -1, -1),
@@ -664,7 +671,7 @@ class Trainer(ASTCAwareTrainer):
         model.material_cnn = post.eval()
         model.register_buffer('_material_cnn_version', torch.tensor(MaterialCNN.version, device=self.device))
         return dict(steps=steps, best_step=best_step, best_validation_loss=best,
-                    native_size=[native_h, native_w],
+                    inference_size=[infer_h, infer_w],
                     gt_size=[self.texture_height, self.texture_width],
                     parameters=sum(p.numel() for p in post.parameters()),
                     seconds=time.perf_counter()-started, history=history)
@@ -701,13 +708,16 @@ class Trainer(ASTCAwareTrainer):
     @torch.no_grad()
     def _fill_predicted_mip(self, mip: int, mip_height: int, mip_width: int) -> torch.Tensor:
         """Tiled full-plane forward (caps tcnn batch size; scatter by row/col to avoid layout bugs)."""
-        if mip == 0 and (material_size(self.model, mip_height, mip_width) != (mip_height, mip_width)
-                         or self.model.material_cnn is not None):
-            base = (self.astc_superres_base_mip0.permute(2, 0, 1)[None]
-                    if self.super_resolution_enable and self.model._decoder_adaptation_features is not None else None)
+        if mip == 0:
+            size = comparison_material_size(self.model, mip_height, mip_width, self.ref_astc_resolution)
+            base = (cached_astc_base(self.dataset, self.astc_codec,
+                                     self.configs.super_resolution_base_resolution, output_size=size)
+                    if self.super_resolution_enable and (self.model._decoder_adaptation_features is not None
+                                                         or getattr(self.model, '_compressed_material', False)) else None)
             return _render_model_mip0(self.model, self.dataset, mip_height, mip_width, self.num_mips,
                                      self.device, superres_base_override=base,
-                                     inference_tile=self.eval_inference_tile)[0].permute(1, 2, 0)
+                                     inference_tile=self.eval_inference_tile,
+                                     inference_size=size)[0].permute(1, 2, 0)
         device = self.device
         c = self.model.num_channels
         out = torch.empty(mip_height, mip_width, c, device=device, dtype=torch.float32)
@@ -835,6 +845,31 @@ class Trainer(ASTCAwareTrainer):
             save_path = os.path.join(output_root, vc['display_name'], filename)
             TF.to_pil_image(tex_image).save(save_path)
 
+
+    @contextlib.contextmanager
+    def _compressed_material(self):
+        """Use an isolated deployment model for material exports and their metrics."""
+        source = self.model
+        decoded = copy.deepcopy(source).eval()
+        decoded.simulate_quantize()
+        apply_astc_to_feature_grids(decoded, self.astc_codec.roundtrip_rgba)
+        decoded._decoder_adaptation_features = None
+        decoded._compressed_material = True
+        self.model = decoded
+        try:
+            yield
+        finally:
+            self.model = source
+
+
+    @torch.no_grad()
+    def save_compressed_materials(self, output_root, iteration):
+        self._ensure_visual_dirs(output_root)
+        with self._compressed_material():
+            for mip in self._infer_mips():
+                pred, gt, _, _ = self._render_mip_pair(mip)
+                self._save_mip_visuals(pred, gt, output_root, f'{iteration}_{mip}.png')
+
     @staticmethod
     def _mean_metric(values: List[float]) -> float:
         return float(torch.tensor(values).mean().item()) if values else 0.0
@@ -881,7 +916,9 @@ class Trainer(ASTCAwareTrainer):
                     )
 
                 if should_save_visuals:
-                    self._save_mip_visuals(pred, gt, self.media_path, f"{curr_iter}_{mip}.png")
+                    with self._compressed_material():
+                        compressed, gt, _, _ = self._render_mip_pair(mip)
+                    self._save_mip_visuals(compressed, gt, self.media_path, f"{curr_iter}_{mip}.png")
 
         finally:
             self._restore_feature_grid_state(feature_grid_backup)
@@ -944,9 +981,7 @@ class Trainer(ASTCAwareTrainer):
         material_metric_lines = ["Mip Group PSNR SSIM LPIPS\n"]
         material_group_order = ("diffuse", "normal", "romsd", "average")
 
-        was_training = self.model.training
-        try:
-            self.model.eval()
+        with self._compressed_material():
             for mip in self._infer_mips():
                 pred, gt, mip_height, mip_width = self._render_mip_pair(mip)
                 material_metrics = self._compute_material_metrics(pred, gt)
@@ -968,8 +1003,6 @@ class Trainer(ASTCAwareTrainer):
                         f"Mip_{mip} {group_name} {group_metric[0]:.4f} "
                         f"{group_metric[1]:.4f} {group_metric[2]:.4f}\n"
                     )
-        finally:
-            self.model.train(was_training)
 
         psnr_avg = self._mean_metric(psnr_list)
         ssim_avg = self._mean_metric(ssim_list)
@@ -1021,9 +1054,8 @@ class Trainer(ASTCAwareTrainer):
         was_training = self.model.training
         self.model.eval()
         try:
-            ref_h, ref_w = _ref_astc_hw_from_side(
-                self.ref_astc_resolution or max(material_size(self.model, self.texture_height, self.texture_width)),
-                self.texture_height, self.texture_width)
+            ref_h, ref_w = comparison_material_size(
+                self.model, self.texture_height, self.texture_width, self.ref_astc_resolution)
             reference = comparison_reference(self.dataset, self.astc_codec, ref_h, ref_w)
             gt = reference['gt']
             quant_model = copy.deepcopy(self.model)
@@ -1038,7 +1070,7 @@ class Trainer(ASTCAwareTrainer):
                     self.dataset,
                     self.astc_codec,
                     int(self.configs.super_resolution_base_resolution),
-                    output_size=material_size(fntc_astc_model, self.texture_height, self.texture_width),
+                    output_size=(ref_h, ref_w),
                 )
             fntc_astc = _render_model_mip0(
                 fntc_astc_model,
@@ -1049,6 +1081,7 @@ class Trainer(ASTCAwareTrainer):
                 self.device,
                 superres_base_override=astc_base,
                 inference_tile=self.eval_inference_tile,
+                inference_size=(ref_h, ref_w),
             )
             traditional_astc = reference['astc']
             path, metrics = save_pbr_comparison(
@@ -1059,6 +1092,7 @@ class Trainer(ASTCAwareTrainer):
                 output_root=output_root,
                 curr_iter=curr_iter,
                 resolution=self.pbr_render_resolution,
+                detail_resolution=self.configs.pbr_detail_resolution,
                 astc_block=self.astc_block,
                 ssim_metric=self.ssim,
                 lpips_metric=self.lpips,
