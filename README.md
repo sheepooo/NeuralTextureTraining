@@ -123,7 +123,7 @@ For detailed naming conventions, keyword matching, and channel counts, refer to 
 
 ## Running
 
-Run commands from the project root. `configs.py` automatically loads `config.yaml`; `--config path/to/recipe.yaml` selects another YAML, and CLI arguments override its values. The default recipe enables Mip0, XY normals, residual SR, four feature gradients and multi-stage training. Per-grid entries in `feature_grid_configs` specify their own quantization/export precision.
+Run commands from the project root. `configs.py` automatically loads `config_pc.yaml`; `--config path/to/recipe.yaml` selects another YAML, and CLI arguments override its values. PC uses `config_pc.yaml` by default; select Mobile with `--config config_mobile.yaml`. The default recipe enables Mip0, XY normals, residual SR, four feature gradients and multi-stage training. Per-grid entries in `feature_grid_configs` specify their own quantization/export precision.
 
 ### Training
 
@@ -131,7 +131,7 @@ Run training with the following command:
 
 ```bash
 python train.py \
-    --config config.yaml \
+    --config config_pc.yaml \
     --mode train \
     --data_dir ./data/test \
     --save_dir ./outputs
@@ -141,7 +141,7 @@ To start single-stage training from a completed run's final checkpoint, reuse th
 
 ```bash
 python train.py \
-    --config config.yaml \
+    --config config_pc.yaml \
     --mode train \
     --data_dir ./data/test \
     --save_dir ./outputs \
@@ -195,7 +195,7 @@ During training, evaluation metrics are automatically logged. For inference, reu
 
 ```bash
 python train.py \
-    --config config.yaml \
+    --config config_pc.yaml \
     --mode infer \
     --data_dir ./data/test \
     --save_dir ./outputs \
@@ -220,9 +220,9 @@ The following metrics are logged automatically during training:
 - **Loss/train**: Training loss
 - **PSNR / SSIM / LPIPS**: Image quality metrics per Mip level
 
-Set `mip0_only: true` in `config.yaml` (or pass `--mip0_only`) to restrict training samples and
+Set `mip0_only: true` in `config_pc.yaml` (or pass `--mip0_only`) to restrict training samples and
 loss, inference metrics and visualizations, and comparison inputs to the full-resolution Mip0.
-The bundled `config.yaml` sets this to `true`. Multi-Mip training requires `--no-mip0_only --no-multi_stage_training_enable --no-astc_aware_enable`; native reconstruction below GT resolution additionally requires Mip0.
+The bundled `config_pc.yaml` sets this to `true`. Multi-Mip training requires `--no-mip0_only --no-multi_stage_training_enable --no-astc_aware_enable`; native reconstruction below GT resolution additionally requires Mip0.
 
 ---
 
@@ -286,7 +286,7 @@ Backends are `astcenc` and `astc_differentiable_proxy`. The latter uses legal AS
 `astc_differentiable_proxy` directly trains legal endpoint/weight parameters on CUDA every step
 after warmup, with validated symbol searches and low-frequency material projection. Both use
 the existing reconstruction/PBR losses; LPIPS remains an evaluation metric. Backend dependencies
-resolve automatically. The default `config.yaml` uses:
+resolve automatically. The default `config_pc.yaml` uses:
 
 ```yaml
 astc_aware_enable: true

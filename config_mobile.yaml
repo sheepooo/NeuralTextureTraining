@@ -1,0 +1,97 @@
+# ============================================================
+# FNTC Baseline Configuration
+# This file serves as the persistent default config for training.
+# Priority chain: argparse defaults -> selected YAML -> CLI args
+# ============================================================
+
+# ---------- quantization configs ----------
+qat_noise_schedule: "cosine"
+qat_noise_mult_start: 1.0
+qat_noise_mult_end: 0.25
+qat_noise_warmup_frac: 0.1
+
+# ---------- model configs ----------
+output_activation: "hard_swish"
+direct_diffuse_infer_mode: "disable"  # disable | rgb | ycocg
+normal_encoding: "xy"  # xyz | xy | hemi_oct
+mip0_only: true  # true: train, sample, evaluate, and compare Mip0 only
+subpixel_sampling_enable: true
+subpixel_sampling_ratio: 0.5
+subpixel_jitter: 0.5
+
+# ---------- feature grid configs ----------
+feature_grid_configs:
+  - max_resolution: 1024
+    quantize_bits: 8
+    save_bits: 32
+    learning_rate: 0.0005
+  - max_resolution: 512
+    quantize_bits: 8
+    save_bits: 32
+    learning_rate: 0.001
+
+# ---------- feature gradient configs ----------
+feature_gradient_count: 0  # 0 off | 2 right/down | 4 axial | 8 3x3 | 24 5x5
+
+# ---------- tile cnn configs ----------
+material_cnn_enable: false  # train after representation -> decoder -> layout_refit; load for inference
+material_cnn_steps: 50000
+
+# ---------- super resolution configs ----------
+super_resolution_enable: false
+super_resolution_base_resolution: 512
+
+# ---------- tiled positional encoding configs ----------
+n_frequencies: 0
+pos_encoding_tile_size: 6
+
+# ---------- astc aware configs ----------
+astc_aware_enable: true
+astc_codec_backend: astc_differentiable_proxy  # astcenc | astc_differentiable_proxy
+astc_codec_start_frac: 0.1
+# astc_differentiable_proxy only
+astc_learning_rate: 0.001  # CUDA endpoint and weight updates
+astc_decoder_projection_interval: 0  # projection requires one grid and SR; disabled for this two-grid non-SR preset
+# astcenc only
+astc_codec_in_loop_interval: 100  # astcenc only; CUDA runs every iteration
+astc_codec_update_latent: false  # astcenc identity STE; CUDA learns codec parameters
+
+# ---------- trainer configs ----------
+# representation: feature grid + SR base + mip + bias
+# decoder: frozen ASTC features + feature differences + optional PE + SR base + mip + bias
+# layout_refit: frozen decoder, offline latent/layout optimization
+multi_stage_training_enable: false
+multi_stage_training_decoder_steps: 50000
+multi_stage_training_decoder_lr_multiplier: 1.0
+multi_stage_training_layout_refit_steps: 1000  # offline latent/layout pass; 0 disables
+
+# ---------- ASTC comparison configs ----------
+ref_astc_resolution: 1024
+
+# ---------- PBR scene comparison configs ----------
+enable_pbr_compare: true
+pbr_compare_interval: 5000
+pbr_render_resolution: 1024  # final cropped Cornell-box height per panel
+pbr_detail_resolution: 2048  # independent detail viewport, width and height
+pbr_detail_center: [0.5, 0.62]  # normalized x/y in the original square camera raster
+pbr_detail_zoom: 4.0  # separately render the focused viewport
+pbr_mip_lod_bias: 0.0  # use one sharper mip level
+pbr_loss_enable: true
+pbr_loss_weight: 0.2
+pbr_directional_light_enable: true
+# Direction points from the shaded surface toward the light.
+pbr_directional_light_direction: [-0.45, 0.62, -0.72]
+pbr_directional_light_intensity: 13.4
+pbr_directional_light_color: [1.0, 1.0, 1.0]
+pbr_point_lights:
+  - position: [0.0, 0.82, 0.7]
+    intensity: 6.5
+    color: [1.0, 1.0, 1.0]
+  - position: [-0.8, 0.45, -0.15]
+    intensity: 1.2
+    color: [1.0, 1.0, 1.0]
+
+# ---------- network configs ----------
+n_neurons: 32
+n_hidden_layers: 0
+learning_rate: 0.002

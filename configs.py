@@ -60,7 +60,7 @@ def _load_yaml_defaults(config_path=None):
 
     Args:
         config_path: Explicit path to a YAML config file. If None, auto-discovers
-                     ``config.yaml`` in the project root directory (same dir as this file).
+                     ``config_pc.yaml`` in the project root directory (same dir as this file).
 
     Returns:
         dict of parameter defaults, or empty dict if file not found.
@@ -68,8 +68,7 @@ def _load_yaml_defaults(config_path=None):
     if config_path is not None:
         p = Path(config_path)
     else:
-        # Auto-discover config.yaml next to this file
-        p = Path(__file__).resolve().parent / "config.yaml"
+        p = Path(__file__).resolve().parent / "config_pc.yaml"
 
     if not p.exists():
         if config_path is not None:
@@ -479,7 +478,7 @@ def get_args():
 
     # --config: path to a YAML config file (parsed first, then overridden by CLI args)
     parser.add_argument('--config', type=str, default=None,
-                        help='path to YAML config file (overrides argparse defaults, overridden by CLI args)')
+                        help='YAML config path (default: config_pc.yaml; mobile: config_mobile.yaml)')
 
     ### ---------- experiment configs ---------- ###
     parser.add_argument('--data_dir', type=str, default='data/test',

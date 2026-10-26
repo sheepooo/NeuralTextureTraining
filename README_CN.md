@@ -119,7 +119,7 @@ data
 
 ## 运行
 
-从项目根目录执行命令。`configs.py` 自动加载 `config.yaml`；`--config path/to/recipe.yaml` 可指定其他 YAML，CLI 参数覆盖 YAML 值。默认配置启用 Mip0、XY 法线、残差超分、四个 feature gradients 和多阶段训练。`feature_grid_configs` 中每个 grid 单独指定量化与导出精度。
+从项目根目录执行命令。`configs.py` 默认加载 PC 配置 `config_pc.yaml`，Mobile 使用 `--config config_mobile.yaml`；`--config path/to/recipe.yaml` 可指定其他 YAML，CLI 参数覆盖 YAML 值。默认 PC 配置启用 Mip0、XY 法线、残差超分、四个 feature gradients 和多阶段训练。`feature_grid_configs` 中每个 grid 单独指定量化与导出精度。
 
 ### 训练
 
@@ -127,7 +127,7 @@ data
 
 ```bash
 python train.py \
-    --config config.yaml \
+    --config config_pc.yaml \
     --mode train \
     --data_dir ./data/test \
     --save_dir ./outputs
@@ -137,7 +137,7 @@ python train.py \
 
 ```bash
 python train.py \
-    --config config.yaml \
+    --config config_pc.yaml \
     --mode train \
     --data_dir ./data/test \
     --save_dir ./outputs \
@@ -191,7 +191,7 @@ ROMSD 的 LPIPS 按有效标量通道分别计算，再取平均值。
 
 ```bash
 python train.py \
-    --config config.yaml \
+    --config config_pc.yaml \
     --mode infer \
     --data_dir ./data/test \
     --save_dir ./outputs \
@@ -216,7 +216,7 @@ tensorboard --logdir ./outputs
 - **Loss/train**：训练损失
 - **PSNR / SSIM / LPIPS**：各 Mip 级别的图像质量评估指标
 
-在 `config.yaml` 中设置 `mip0_only: true`（或传入 `--mip0_only`），可将训练采样与 loss、
+在 `config_pc.yaml` 中设置 `mip0_only: true`（或传入 `--mip0_only`），可将训练采样与 loss、
 推理指标与可视化以及 comparison 输入统一限制为全分辨率 Mip0。仓库默认 YAML 为 `true`。多 Mip 训练需使用 `--no-mip0_only --no-multi_stage_training_enable --no-astc_aware_enable`；原生材质分辨率低于 GT 时仍须使用 Mip0。
 
 ## 主要特性
@@ -370,7 +370,7 @@ bias，并增加 `decoder_output_bias` 作为输出层 bias。残差超分模式
 
 各训练阶段复用原生材质重建路径。普通推理和 ASTC/PBR 评测在 `ref_astc_resolution` 指定的共同尺寸生成 FNTC/ASTC 材质，仅尺寸不同于 GT 时才使用 bilinear-repeat 缩放到 GT。布局选择覆盖整倍数比例（如 1K→2K）下所有受影响的 GT 像素。跨分辨率训练当前要求 `mip0_only: true`；`ref_astc_resolution` 默认跟随 FNTC 材质边长，显式设置同时覆盖 FNTC 推理及 ASTC 基线尺寸，与 feature grid 分辨率独立；material CNN 在该推理尺寸上运行，再按需缩放到 GT。日志及 `reconstruction.json` 区分材质/GT 分辨率和原生 decoder 查询数。ASTC 输入及材质投影候选共用材质专用 mip 预滤波，包含法线向量处理。
 
-在 `config.yaml` 中设置 `super_resolution_enable: true` 并指定
+在 `config_pc.yaml` 中设置 `super_resolution_enable: true` 并指定
 `super_resolution_base_resolution` 可启用超分残差训练。该分辨率的原始纹理 mip 作为 base，
 经双线性上采样后与 feature grid 特征拼接。同分辨率时残差目标为 `GT - bilinear_base`；跨分辨率时监督放大后的重建材质与 GT。评测、推理和 ASTC
 对比均先在原生材质中心计算 `clamp(bilinear_base + predicted_residual, 0, 1)`，再统一放大后与 GT 计算指标。更低 Mip 使用
