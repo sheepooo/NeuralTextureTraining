@@ -91,7 +91,14 @@ def sample_material(model, uv, size, base_image=None):
     values = model(inputs).float()
     if base is not None:
         values = values + base
-    values = values.clamp(0, 1)
+    bounded = values.clamp(0, 1)
+    if model.training:
+        # Match the deployed raster in forward while letting reconstruction
+        # gradients recover channels initialized outside [0, 1]. Hard clamp
+        # alone permanently strands negative non-SR outputs at black.
+        values = bounded.detach() + (values - values.detach())
+    else:
+        values = bounded
     return (values[inverse].reshape(len(uv), 4, -1) * weights[..., None]).sum(1)
 
 
@@ -529,42 +536,23 @@ class TextureDataset(torch.nn.Module):
             weights.extend([w] * n_ch)
         return weights
 
-    def expand_to_canonical(self, x: TensorType["batch_size", "num_channels"]) -> TensorType["batch_size", 11]:
-        """Expand [B, num_channels] to canonical channels; fill missing texture positions with 0."""
-        device = x.device
-        dtype = x.dtype
-        batch_size = x.shape[0]
-        out = torch.zeros((batch_size, self.canonical_num_channels), device=device, dtype=dtype)
+    def expand_to_canonical(self, x: torch.Tensor) -> torch.Tensor:
+        """Expand the last dimension to canonical channels, filling absent textures with 0."""
+        out = x.new_zeros((*x.shape[:-1], self.canonical_num_channels))
         for tex_type in self.available_textures:
             ds_start, ds_end = self.channel_slices[tex_type]
             canon_start, canon_end = self.canonical_channel_slices[tex_type]
-            out[:, canon_start:canon_end] = x[:, ds_start:ds_end]
+            out[..., canon_start:canon_end] = x[..., ds_start:ds_end]
         return out
 
     def expand_mip_to_canonical(self, mip_tensor: TensorType["num_mips", "H", "W", "num_channels"]) -> TensorType["num_mips", "H", "W", 11]:
         """Expand mip_cache [num_mips, H, W, num_channels] to [num_mips, H, W, canonical_channels]; fill missing with 0."""
         if isinstance(mip_tensor, list):
-            return [self.expand_mip_to_canonical_level(level) for level in mip_tensor]
-        num_mips, h, w, c = mip_tensor.shape
-        device = mip_tensor.device
-        dtype = mip_tensor.dtype
-        out = torch.zeros((num_mips, h, w, self.canonical_num_channels), device=device, dtype=dtype)
-        for tex_type in self.available_textures:
-            ds_start, ds_end = self.channel_slices[tex_type]
-            canon_start, canon_end = self.canonical_channel_slices[tex_type]
-            out[:, :, :, canon_start:canon_end] = mip_tensor[:, :, :, ds_start:ds_end]
-        return out
+            return [self.expand_to_canonical(level) for level in mip_tensor]
+        return self.expand_to_canonical(mip_tensor)
 
     def expand_mip_to_canonical_level(self, mip_tensor: torch.Tensor) -> torch.Tensor:
-        out = torch.zeros(
-            (*mip_tensor.shape[:-1], self.canonical_num_channels),
-            device=mip_tensor.device, dtype=mip_tensor.dtype,
-        )
-        for tex_type in self.available_textures:
-            ds_start, ds_end = self.channel_slices[tex_type]
-            canon_start, canon_end = self.canonical_channel_slices[tex_type]
-            out[..., canon_start:canon_end] = mip_tensor[..., ds_start:ds_end]
-        return out
+        return self.expand_to_canonical(mip_tensor)
 
     def get_canonical_loss_weights(self, config_weights: Optional[Dict[str, float]] = None) -> List[float]:
         """Return per-channel loss weights of canonical length; channels for missing textures are 0."""

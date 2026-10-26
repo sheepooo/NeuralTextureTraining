@@ -25,7 +25,7 @@ feature_grid_configs:
     quantize_bits: 8
     save_bits: 32
     learning_rate: 0.0005
-  - max_resolution: 512
+  - max_resolution: 1024
     quantize_bits: 8
     save_bits: 32
     learning_rate: 0.001

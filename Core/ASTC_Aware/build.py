@@ -54,7 +54,7 @@ def resolve_encoder_source(native_root=None):
     installs the same pinned release as the CPU executable into the established
     tools/astc_encoder_source directory, never into Core or a second clone.
     """
-    from Comparison_ASTC import ASTCENC_DEFAULT_VERSION
+    from Common.comparison_astc import ASTCENC_DEFAULT_VERSION
 
     native_root = Path(native_root or Path(__file__).resolve().parent / "native").resolve()
     for parent in native_root.parents:

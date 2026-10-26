@@ -16,7 +16,9 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
 from Core.Material_Encoding.normal_encoding import decode_normal
-from Comparison_ASTC import comparison_label_color, method_label, metric_records, write_metrics
+from Common.comparison_astc import (comparison_label_color, method_label, metric_records, write_metrics,
+                             cached_astc_base, comparison_reference, log_comparison_storage)
+from Common.material_reconstruction import comparison_material_size, make_deployment_model, _render_model_mip0
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:
@@ -564,3 +566,34 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
             print(f'[PBR Test] {view} Iter {curr_iter}: {label:<{label_width}} '
                   f'PSNR={psnr:8.4f}  SSIM={ssim:7.4f}  LPIPS={lpips:7.4f}{suffix}')
     return path, metrics
+
+
+@torch.no_grad()
+def run_pbr_comparison_pipeline(model, dataset, codec, config, output_root, *, curr_iter=None,
+                                ssim_metric=None, lpips_metric=None, lighting=None,
+                                report_context=None, save_outputs=True):
+    """Reconstruct deployment materials and produce the scene comparison."""
+    height, width = dataset.texture_height, dataset.texture_width
+    ref_h, ref_w = comparison_material_size(model, height, width, config.ref_astc_resolution)
+    reference = comparison_reference(dataset, codec, ref_h, ref_w)
+    decoded = make_deployment_model(model, codec)
+    base = (cached_astc_base(dataset, codec, config.super_resolution_base_resolution, (ref_h, ref_w))
+            if model.super_resolution_enable else None)
+    prediction = _render_model_mip0(
+        decoded, dataset, height, width, dataset.num_mips, config.device,
+        superres_base_override=base, inference_tile=config.eval_inference_tile,
+        inference_size=(ref_h, ref_w))
+    del decoded
+    storage = log_comparison_storage(model, dataset, codec.astc_block, config.ref_astc_resolution, verbose=False)
+    context = dict(report_context or {}, gt_size=[height, width], inference_size=[ref_h, ref_w],
+                   storage_bytes={method_label('fntc', codec.astc_block): storage[f'fntc_astc_{codec.astc_block}'],
+                                  method_label('astc', codec.astc_block): storage[f'ref_astc_{codec.astc_block}'],
+                                  'GT': storage['gt']})
+    return save_pbr_comparison(
+        fntc_astc_texture=prediction, traditional_astc_texture=reference['astc'], gt_texture=reference['gt'],
+        dataset=dataset, output_root=output_root, curr_iter=curr_iter,
+        resolution=config.pbr_render_resolution, detail_resolution=config.pbr_detail_resolution,
+        astc_block=codec.astc_block, ssim_metric=ssim_metric, lpips_metric=lpips_metric,
+        mip_lod_bias=config.pbr_mip_lod_bias, lighting=lighting,
+        detail_center=config.pbr_detail_center, detail_zoom=config.pbr_detail_zoom,
+        reference_cache=reference['pbr'], report_context=context, save_outputs=save_outputs)

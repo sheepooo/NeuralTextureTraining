@@ -1,4 +1,5 @@
 import argparse
+import json
 import difflib
 import math
 import os
@@ -9,17 +10,6 @@ from typing import Dict, List, Optional
 import torch
 import yaml
 from Core.Feature_Grid.feature_grid import FeatureGridSpec
-
-
-def _parse_bool(value):
-    if isinstance(value, bool):
-        return value
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    raise argparse.ArgumentTypeError(f"expected a boolean, got '{value}'")
 
 
 def _normalize_astc_block(value: str) -> tuple[str, tuple[int, int]]:
@@ -696,3 +686,23 @@ def get_args():
 
     # Stage 2: full parse (CLI args override YAML values)
     return parser.parse_args()
+
+
+def write_resolved_config(configs, directory) -> None:
+    """Persist scalar/list/dict config values so log analyzers can recover run settings."""
+    out = {}
+    for key, value in vars(configs).items():
+        if key.startswith("_"):
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[key] = value
+        elif isinstance(value, (list, tuple, dict)):
+            try:
+                json.dumps(value)
+                out[key] = value
+            except TypeError:
+                out[key] = str(value)
+    path = os.path.join(directory, "resolved_config.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, sort_keys=True)
+    print(f"resolved_config: {path}")

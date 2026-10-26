@@ -123,6 +123,7 @@ def refit_layout(trainer, steps):
     weights = torch.tensor(trainer.output_loss_weights, device=model.device)
     method = 'fntc_astc_' + trainer.astc_block
     stats = {'applied': True, 'steps': steps, 'accepted': False, 'best_step': 0, 'checks': []}
+    completed = False
     try:
         before = trainer.run_astc_comparison(curr_iter=model.current_iter, verbose=False, save_outputs=False)
         before_pbr = trainer.run_pbr_comparison(curr_iter=model.current_iter, return_metrics=True, save_outputs=False)[1] if trainer.enable_pbr_compare else None
@@ -211,9 +212,10 @@ def refit_layout(trainer, steps):
         trainer._sync_astc_source()
         stats.update(before=list(before[method]['average']), candidate=list(best_material),
                      before_pbr=before_pbr, candidate_pbr=best_pbr)
+        completed = True
         return stats
     finally:
-        if not stats['accepted']:
+        if not completed or not stats['accepted']:
             grid.load_state_dict(saved_codec)
             with torch.no_grad():
                 source.copy_(saved_source)
@@ -223,5 +225,5 @@ def refit_layout(trainer, steps):
         for p, flag in flags:
             p.requires_grad_(flag)
         model._qat_param_cache.clear()
-        if stats['accepted']:
+        if completed and stats['accepted']:
             trainer._astc_block_optimizer = None

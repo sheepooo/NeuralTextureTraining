@@ -22,19 +22,7 @@ from Core.Feature_Grid.feature_grid import (
     feature_to_unorm, qat_noise_multiplier, quantize_feature_ste, quantize_feature_tensor,
     unorm_to_feature,
 )
-from Core.Material_Encoding.normal_encoding import normal_encoding_channels
-
-# Fixed channel order aligned with: diffuse, normal, roughness, occlusion, metallic, specular, displacement
-# Fixed texture order; normal can be 3 channels (xyz) or 2 channels (xy/hemi_oct).
-CANONICAL_CHANNEL_ORDER = ["diffuse", "normal", "roughness", "occlusion", "metallic", "specular", "displacement"]
-
-
-def canonical_channel_counts(normal_encoding: str = "xyz"):
-    return [3, normal_encoding_channels(normal_encoding), 1, 1, 1, 1, 1]
-
-
-def canonical_num_channels(normal_encoding: str = "xyz") -> int:
-    return sum(canonical_channel_counts(normal_encoding))
+from dataset import get_canonical_num_channels
 
 
 class TCNNModel(torch.nn.Module):
@@ -90,7 +78,7 @@ class TCNNModel(torch.nn.Module):
         self.astc_proxy = torch.nn.ModuleList()
         # Network output matches the selected canonical texture layout.
         self.normal_encoding = str(getattr(config, "normal_encoding", "xyz")).lower()
-        self.num_channels = canonical_num_channels(self.normal_encoding)
+        self.num_channels = get_canonical_num_channels(self.normal_encoding)
         self.super_resolution_enable = bool(getattr(config, "super_resolution_enable", False))
         self.direct_diffuse_infer_mode = str(getattr(config, "direct_diffuse_infer_mode", "disable")).lower()
         if self.direct_diffuse_infer_mode not in {"disable", "rgb", "ycocg"}:

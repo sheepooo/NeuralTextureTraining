@@ -27,9 +27,10 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
 from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
-from Core.Feature_Grid.sampling import resize_bilinear_repeat, sample_image
+from Core.Feature_Grid.sampling import resize_bilinear_repeat
 from Core.Material_Encoding.normal_encoding import decode_normal, normal_angular_psnr
-from dataset import material_size, prefiltered_material, clean_base_image
+from dataset import prefiltered_material
+from Common.material_reconstruction import (comparison_material_size, _render_gt_mip0, _render_model_mip0, _ref_astc_hw_from_side)
 
 
 # ---------------------------------------------------------------------------
@@ -49,22 +50,6 @@ def normalize_astc_block(block: str) -> str:
     if w <= 0 or h <= 0:
         raise ValueError(f"Invalid ASTC block '{block}'. Block dimensions must be positive.")
     return f"{w}x{h}"
-
-
-def _ref_astc_hw_from_side(side: Optional[int], base_h: int, base_w: int) -> Tuple[int, int]:
-    """Scale the longest material edge to side while preserving the GT aspect ratio."""
-    if side is None:
-        return base_h, base_w
-    if side <= 0:
-        raise ValueError(f"ref_astc_resolution must be a positive int (square edge), got {side}")
-    scale = float(side) / float(max(base_h, base_w))
-    return max(1, int(round(base_h * scale))), max(1, int(round(base_w * scale)))
-
-
-def comparison_material_size(model, height: int, width: int, ref_astc_resolution=None):
-    """Shared FNTC/ASTC raster, independent of latent resolution when specified."""
-    edge = ref_astc_resolution or max(material_size(model, height, width))
-    return _ref_astc_hw_from_side(edge, height, width)
 
 
 def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None, verbose=True,
@@ -298,70 +283,6 @@ def cached_astc_base(dataset, codec, base_resolution, output_size):
         image = _astc_roundtrip_superres_base_mip0(dataset, codec.roundtrip_rgba, base_resolution, output_size)
         cache['base_size'], cache['base'] = key, image.cpu()
     return cache['base'].to(dataset.mip_cache[0].device)
-
-
-@torch.no_grad()
-def _render_gt_mip0(dataset, texture_height: int, texture_width: int) -> torch.Tensor:
-    mip = 0
-    mip_height = texture_height // (2 ** mip)
-    mip_width = texture_width // (2 ** mip)
-    gt_slice = dataset.mip_cache[mip]
-    gt_canonical = dataset.expand_to_canonical(gt_slice.reshape(-1, gt_slice.shape[-1]))
-    gt_canonical = gt_canonical.reshape(mip_height, mip_width, -1)
-    return gt_canonical.permute(2, 0, 1)[None, ...]
-
-
-@torch.no_grad()
-def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, num_mips: int, device: str,
-                       superres_base_override: Optional[torch.Tensor] = None,
-                       inference_tile: int = 512,
-                       inference_size: Optional[Tuple[int, int]] = None) -> torch.Tensor:
-    """Render Mip0 in tiles, bounding decoder and feature-gradient temporaries."""
-    mip = 0
-    H = texture_height >> mip
-    W = texture_width >> mip
-    target_size = (H, W)
-    H, W = inference_size if inference_size is not None else material_size(model, H, W)
-    native_base = None
-    if getattr(model, 'super_resolution_enable', False) and (H, W) != target_size:
-        native_base = (clean_base_image(dataset, (H, W)) if superres_base_override is None
-                       else superres_base_override)
-        if tuple(native_base.shape[-2:]) != (H, W):
-            raise ValueError('Render the compressed SR base at native material size before passing superres_base_override')
-    mip_f = float(mip) / max(1, num_mips - 1)
-    step = max(1, int(inference_tile) or max(H, W))
-    hwc = None
-    for h0 in range(0, H, step):
-        h1 = min(h0 + step, H)
-        for w0 in range(0, W, step):
-            w1 = min(w0 + step, W)
-            rr, cc = torch.meshgrid(torch.arange(h0, h1, device=device),
-                                    torch.arange(w0, w1, device=device), indexing="ij")
-            inp = torch.stack(((cc + 0.5) / W, (rr + 0.5) / H,
-                               torch.full_like(rr, mip_f)), dim=-1).reshape(-1, 3)
-            if getattr(model, "super_resolution_enable", False):
-                if native_base is not None:
-                    base = sample_image(native_base, inp[:, :2])
-                elif superres_base_override is None:
-                    base_data = dataset.superres_base_cache[mip][h0:h1, w0:w1]
-                    base = dataset.expand_to_canonical(base_data.reshape(-1, dataset.num_channels)).float()
-                else:
-                    base_chw = superres_base_override[0] if superres_base_override.ndim == 4 else superres_base_override
-                    base = base_chw[:, h0:h1, w0:w1].permute(1, 2, 0).reshape(-1, base_chw.shape[0]).float()
-                y = (base + model(torch.cat([inp, base], dim=1)).float()).clamp(0.0, 1.0)
-            else:
-                y = model(inp).float()
-            if hwc is None:
-                hwc = torch.empty(H, W, y.shape[-1], device=device, dtype=torch.float32)
-            hwc[h0:h1, w0:w1] = y.reshape(h1-h0, w1-w0, -1)
-    if getattr(model, "direct_diffuse_enabled", False) and hasattr(model, "render_direct_diffuse_mip"):
-        direct = model.render_direct_diffuse_mip(mip, H, W)
-        hwc[:, :, :3] = direct.squeeze(0).permute(1, 2, 0).to(hwc.dtype)
-    hwc = torch.nan_to_num(hwc, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-    image = hwc.permute(2, 0, 1)[None, ...]
-    if model.material_cnn is not None:
-        image = model.material_cnn.tiled(image, inference_tile)
-    return resize_bilinear_repeat(image, target_size) if (H, W) != target_size else image
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +821,8 @@ def run_astc_comparison_pipeline(
                                   superres_base_override=astc_base if quant_model._decoder_adaptation_features is not None else None,
                                   inference_tile=inference_tile, inference_size=(ref_h, ref_w))
 
-    astc_grid_model = copy.deepcopy(quant_model)
+    # The uncompressed raster is already materialized; reuse the isolated copy.
+    astc_grid_model = quant_model
     apply_astc_to_feature_grids(astc_grid_model, astc_codec.roundtrip_rgba)
     astc_grid_model.eval()
     pred_fntc_grid_astc = _render_model_mip0(
@@ -959,3 +881,15 @@ def run_astc_comparison_pipeline(
     )
 
     return metrics
+
+
+def write_material_metrics(directory, records, storage, model, dataset, ref_astc_resolution,
+                           channel_weights, *, report_context=None, iteration=None):
+    size = comparison_material_size(model, dataset.texture_height, dataset.texture_width, ref_astc_resolution)
+    return write_metrics(directory, records, evaluation='material', iteration=iteration,
+                         metadata=dict(report_context or {},
+                                       gt_size=[dataset.texture_height, dataset.texture_width],
+                                       inference_size=list(size), normal_encoding=dataset.normal_encoding,
+                                       channel_weights=channel_weights,
+                                       storage_bytes={method_label(name): value for name, value in storage.items()},
+                                       mip_aggregation='arithmetic_mean_of_mip_group_scores'))

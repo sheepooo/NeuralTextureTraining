@@ -4,13 +4,12 @@ import torch
 import torch.nn.functional as F
 import datetime
 import argparse
-import json
 import copy
 import contextlib
 import io
 import math
 import time
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
     StructuralSimilarityIndexMeasure,
@@ -18,7 +17,6 @@ from torchmetrics.image import (
 )
 
 from tensorboardX import SummaryWriter
-import torchvision.transforms.functional as TF
 
 import tinycudann as tcnn
 
@@ -26,23 +24,22 @@ from configs import get_args, inference_mips, mip_sampling_probabilities
 from model import TCNNModel
 from Core.Tile_CNN.material_cnn import MaterialCNN
 from dataset import TextureDataset
-from Core.Material_Encoding.normal_encoding import decode_normal, normal_angular_loss, normal_angular_psnr, normal_vectors
-from configs import Config
-from Comparison_ASTC import (
+from Common.material_loss import MaterialLoss
+from Common.material_reconstruction import (canonical_gt_mip, make_deployment_model, render_material_mip,
+                                          postprocess_material, save_material_visuals,
+                                          comparison_material_size, _render_model_mip0)
+from configs import Config, write_resolved_config
+from Common.comparison_astc import (
     ASTCENC_DEFAULT_PATH,
     cached_astc_base,
-    comparison_reference,
-    _render_model_mip0,
-    comparison_material_size,
     log_comparison_storage,
     _compute_group_metrics,
     run_astc_comparison_pipeline,
-    method_label, metric_records, write_metrics,
+    method_label, metric_records, write_material_metrics,
 )
-from Comparison_PBRScene import save_pbr_comparison
+from Common.comparison_pbr_scene import run_pbr_comparison_pipeline
 from dataset import material_size
 from Core.ASTC_Aware.trainer import ASTCAwareTrainer
-from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
 
 
 class PhaseTrainingControl:
@@ -206,7 +203,6 @@ class Trainer(ASTCAwareTrainer):
         self.model = model
         self.dataset = dataset
         self.eval_inference_tile = max(0, int(configs.eval_inference_tile))
-        self.eval_metrics_max_edge = int(configs.eval_metrics_max_edge)
         self.enable_astc_compare = bool(configs.enable_astc_compare)
         self.astcenc_path = str(getattr(configs, "astcenc_path", ASTCENC_DEFAULT_PATH))
         self.astcenc_quality = str(getattr(configs, "astcenc_quality", "medium"))
@@ -240,118 +236,24 @@ class Trainer(ASTCAwareTrainer):
         self.duration_time = self.end_time - self.start_time
         print(f"Total training time: {self.duration_time}")
 
-    def _group_indices(self, textures: List[str], device: torch.device) -> torch.Tensor:
-        key = (tuple(textures), device)
-        if not hasattr(self, "_loss_group_indices"):
-            self._loss_group_indices = {}
-        if key in self._loss_group_indices:
-            return self._loss_group_indices[key]
-        idx = []
-        for tex in textures:
-            if tex not in self.dataset.available_textures:
-                continue
-            s, e = self.dataset.canonical_channel_slices[tex]
-            idx.extend(range(s, e))
-        indices = torch.tensor(idx, device=device, dtype=torch.long)
-        self._loss_group_indices[key] = indices
-        return indices
+    def _compute_pbr_render_loss(self, gt, pred):
+        return self._material_objective().pbr(gt, pred)
 
-    def _compute_pbr_render_loss(self, gt: torch.Tensor, pred: torch.Tensor) -> torch.Tensor:
-        """Differentiable shaded-RGB loss for PBR-sensitive material channels."""
-        slices = self.dataset.canonical_channel_slices
-        def get_pair(name, channels=1, default=0.0):
-            if name not in self.dataset.available_textures:
-                shape = (gt.shape[0], channels)
-                value = torch.full(shape, default, device=gt.device, dtype=gt.dtype)
-                return value, value
-            s, e = slices[name]
-            return (torch.nan_to_num(gt[:, s:e].float(), nan=default, posinf=default, neginf=default).clamp(0, 1),
-                    torch.nan_to_num(pred[:, s:e].float(), nan=default, posinf=default, neginf=default).clamp(0, 1))
+    def _material_objective(self):
+        if not hasattr(self, '_objective') or self._objective.dataset is not self.dataset:
+            self._objective = MaterialLoss(self.dataset, self.normal_encoding)
+        return self._objective
 
-        gt_diff, pr_diff = get_pair("diffuse", 3, 0.5)
-        gt_norm, pr_norm = get_pair("normal", getattr(self.dataset, "normal_encoding", "xyz") == "xyz" and 3 or 2, 0.5)
-        gt_rough, pr_rough = get_pair("roughness", 1, 0.5)
-        gt_metal, pr_metal = get_pair("metallic", 1, 0.0)
-        gt_spec, pr_spec = get_pair("specular", 1, 0.5)
-
-        gt_n = normal_vectors(gt_norm, self.normal_encoding)
-        pr_n = normal_vectors(pr_norm, self.normal_encoding)
-        # Use a fixed tangent-space light with positive Z so a flat normal map
-        # receives direct light and all PBR channels get useful gradients.
-        lighting = getattr(self, "_pbr_lighting", None)
-        if lighting is None or lighting[0].device != pred.device or lighting[0].dtype != pred.dtype:
-            light = torch.tensor([-0.35, 0.45, 0.82], device=pred.device, dtype=pred.dtype)
-            light = light / torch.clamp(torch.linalg.vector_norm(light), min=1e-6)
-            view = torch.tensor([0.0, 0.0, 1.0], device=pred.device, dtype=pred.dtype)
-            half = (light + view) / torch.clamp(torch.linalg.vector_norm(light + view), min=1e-6)
-            self._pbr_lighting = (light, view, half)
-        light, view, half = self._pbr_lighting
-        def shade(diff, normal, rough, metal, spec):
-            diff = torch.clamp(diff, 0, 1)
-            ndotl = torch.clamp((normal * light[None]).sum(1, keepdim=True), 0, 1)
-            ndoth = torch.clamp((normal * half[None]).sum(1, keepdim=True), 0, 1)
-            vdoth = torch.clamp((view[None] * half[None]).sum(1, keepdim=True), 0, 1)
-            # Avoid the singular GGX lobe at roughness=0.045 during training.
-            rough = torch.clamp(rough, 0.12, 1.0)
-            alpha = rough * rough
-            d_den = (ndoth * ndoth * (alpha * alpha - 1) + 1) ** 2
-            d = alpha * alpha / (torch.pi * torch.clamp(d_den, min=0.04))
-            d = torch.clamp(d, max=8.0)
-            f0 = (0.02 + 0.14 * spec) * (1 - metal) + diff * metal
-            fresnel = torch.clamp(f0 + (1 - f0) * (1 - vdoth) ** 5, 0.0, 1.0)
-            shaded = torch.clamp(diff * (1 - metal) * (1 - fresnel) * ndotl / torch.pi
-                                 + d * fresnel * ndotl * 0.25 + diff * 0.03, 0, 1)
-            return torch.nan_to_num(shaded, nan=0.0, posinf=1.0, neginf=0.0)
-        pred_shaded = shade(pr_diff, pr_n, pr_rough, pr_metal, pr_spec)
-        gt_shaded = shade(gt_diff, gt_n, gt_rough, gt_metal, gt_spec).detach()
-        return torch.nan_to_num(torch.nn.functional.smooth_l1_loss(pred_shaded, gt_shaded),
-                                nan=0.0, posinf=1.0, neginf=0.0)
-
-    def _compute_reconstruction_loss(
-        self,
-        gt_texture: torch.Tensor,
-        predict_texture: torch.Tensor,
-        loss_weights: torch.Tensor,
-        curr_iter: Optional[int] = None,
-    ) -> torch.Tensor:
-        total_loss = torch.tensor(0.0, device=gt_texture.device, dtype=torch.float32)
-        stats = {}
-
-        for group, textures in self.dataset.texture_packing.items():
-            idx = self._group_indices(textures, gt_texture.device)
-            if idx.numel() == 0:
-                stats[group] = None
-                continue
-
-            pred = torch.index_select(predict_texture.float(), dim=1, index=idx)
-            gt = torch.index_select(gt_texture.float(), dim=1, index=idx)
-            weights = loss_weights.index_select(0, idx).float()
-            weight = weights.mean()
-
-            if group == "normal":
-                raw_loss = normal_angular_loss(pred, gt, self.normal_encoding)
-                weighted_loss = raw_loss * weights.sum()
-            else:
-                mse = (gt - pred).pow(2).mean(dim=0)
-                raw_loss = mse.mean()
-                weighted_loss = (mse * weights).sum()
-
-            total_loss = total_loss + weighted_loss
-            stats[group] = {
-                "loss": float(weighted_loss.detach().item()),
-                "raw_loss": float(raw_loss.detach().item()),
-                "weight": float(weight.detach().item()),
-            }
-
-            if curr_iter is not None:
-                loss_name = "normal_angular" if group == "normal" else group
-                self.writer.add_scalar(f'Loss/{loss_name}', stats[group]["loss"], curr_iter)
-                self.writer.add_scalar(f'LossRaw/{loss_name}', stats[group]["raw_loss"], curr_iter)
-                self.writer.add_scalar(f'LossWeight/{loss_name}', stats[group]["weight"], curr_iter)
-
+    def _compute_reconstruction_loss(self, gt_texture, predict_texture, loss_weights, curr_iter=None):
+        loss, stats = self._material_objective().reconstruction(gt_texture, predict_texture, loss_weights)
         if curr_iter is not None:
             self._last_loss_stats = stats
-        return total_loss
+            for group, values in stats.items():
+                if values is not None:
+                    name = 'normal_angular' if group == 'normal' else group
+                    for prefix, key in (('Loss', 'loss'), ('LossRaw', 'raw_loss'), ('LossWeight', 'weight')):
+                        self.writer.add_scalar(f'{prefix}/{name}', values[key], curr_iter)
+        return loss
 
     def _loss_stats_str(self) -> str:
         residual_stat = self._last_loss_stats.get("superres_residual")
@@ -376,30 +278,16 @@ class Trainer(ASTCAwareTrainer):
             parts.append(f"{labels[group]}:{value}")
         return ", ".join(parts)
 
-    def _compute_superres_residual_loss(
-        self, target_residual: torch.Tensor, predicted_residual: torch.Tensor, loss_weights: torch.Tensor,
-        curr_iter: Optional[int] = None,
-    ) -> torch.Tensor:
-        """Weighted channel MSE for signed residuals, including encoded normal channels."""
-        mse = (target_residual.float() - predicted_residual.float()).pow(2).mean(dim=0)
-        loss = (mse * loss_weights.float()).sum()
+    def _compute_superres_residual_loss(self, target_residual, predicted_residual, loss_weights, curr_iter=None):
+        loss, stats = self._material_objective().residual(target_residual, predicted_residual, loss_weights,
+                                                        statistics=curr_iter is not None)
         if curr_iter is not None:
-            group_losses = {}
-            for group, textures in self.dataset.texture_packing.items():
-                idx = self._group_indices(textures, target_residual.device)
-                if idx.numel() == 0:
-                    continue
-                group_loss = (mse.index_select(0, idx) * loss_weights.index_select(0, idx).float()).sum()
-                group_losses[group] = group_loss.detach()
-            values = torch.stack([loss.detach(), *group_losses.values()]).tolist()
-            self.writer.add_scalar('Loss/superres_residual', values[0], curr_iter)
-            stats = {"loss": values[0]}
-            for group, value in zip(group_losses, values[1:]):
-                stats[group] = {"loss": value}
-                self.writer.add_scalar(f'Loss/superres_residual_{group}', stats[group]["loss"], curr_iter)
-            self._last_loss_stats = {"superres_residual": stats}
+            self._last_loss_stats = {'superres_residual': stats}
+            self.writer.add_scalar('Loss/superres_residual', stats['loss'], curr_iter)
+            for group, values in stats.items():
+                if group != 'loss':
+                    self.writer.add_scalar(f'Loss/superres_residual_{group}', values['loss'], curr_iter)
         return loss
-
 
     def _reset_training_phase(self, phase, start):
         self._metrics_phase = phase
@@ -608,9 +496,7 @@ class Trainer(ASTCAwareTrainer):
         sy, sx = self.texture_height // infer_h, self.texture_width // infer_w
         started = time.perf_counter()
         with torch.no_grad():
-            decoded = copy.deepcopy(model).eval()
-            decoded.simulate_quantize()
-            apply_astc_to_feature_grids(decoded, self.astc_codec.roundtrip_rgba)
+            decoded = make_deployment_model(model, self.astc_codec)
             base = (cached_astc_base(self.dataset, self.astc_codec,
                                     self.configs.super_resolution_base_resolution,
                                     output_size=(infer_h, infer_w))
@@ -710,137 +596,28 @@ class Trainer(ASTCAwareTrainer):
         for g, bak in zip(self.model.feature_grids, backups):
             g.load_state_dict(bak)
 
-    @staticmethod
-    def _mip_plane_tile(
-        h0: int, h1: int, w0: int, w1: int, plane_h: int, plane_w: int, mip_f: float, device: str
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """[N,3] batch and (row,col) indices; UV=(col+0.5)/W, (row+0.5)/H."""
-        rr, cc = torch.meshgrid(
-            torch.arange(h0, h1, device=device),
-            torch.arange(w0, w1, device=device),
-            indexing="ij",
-        )
-        z = torch.full_like(rr, mip_f, dtype=torch.float32)
-        inp = torch.stack(((cc + 0.5) / plane_w, (rr + 0.5) / plane_h, z), dim=-1).reshape(-1, 3)
-        return inp, rr.reshape(-1).long(), cc.reshape(-1).long()
-
     @torch.no_grad()
-    def _fill_predicted_mip(self, mip: int, mip_height: int, mip_width: int) -> torch.Tensor:
-        """Tiled full-plane forward (caps tcnn batch size; scatter by row/col to avoid layout bugs)."""
-        if mip == 0:
-            size = comparison_material_size(self.model, mip_height, mip_width, self.ref_astc_resolution)
-            base = (cached_astc_base(self.dataset, self.astc_codec,
-                                     self.configs.super_resolution_base_resolution, output_size=size)
-                    if self.super_resolution_enable and (self.model._decoder_adaptation_features is not None
-                                                         or getattr(self.model, '_compressed_material', False)) else None)
-            return _render_model_mip0(self.model, self.dataset, mip_height, mip_width, self.num_mips,
-                                     self.device, superres_base_override=base,
-                                     inference_tile=self.eval_inference_tile,
-                                     inference_size=size)[0].permute(1, 2, 0)
-        device = self.device
-        c = self.model.num_channels
-        out = torch.empty(mip_height, mip_width, c, device=device, dtype=torch.float32)
-        step = max(1, self.eval_inference_tile or max(mip_height, mip_width))
-        mip_f = 0.0 if self.num_mips <= 1 else float(mip) / float(self.num_mips - 1)
-        for h0 in range(0, mip_height, step):
-            h1 = min(h0 + step, mip_height)
-            for w0 in range(0, mip_width, step):
-                w1 = min(w0 + step, mip_width)
-                inp, fr, fc = self._mip_plane_tile(h0, h1, w0, w1, mip_height, mip_width, mip_f, device)
-                if self.super_resolution_enable:
-                    local_indices = torch.stack([fr, fc, torch.full_like(fr, mip)], dim=1)
-                    local_indices[:, :2] *= 2 ** mip
-                    base = self.dataset.get_superres_base(local_indices)
-                    base = self.dataset.expand_to_canonical(base).float()
-                    residual = self.model(torch.cat([inp, base], dim=1)).float()
-                    out[fr, fc, :] = (base + residual).clamp(0.0, 1.0)
-                else:
-                    out[fr, fc, :] = self.model(inp).float()
-        if getattr(self.model, "direct_diffuse_enabled", False) and "diffuse" in self.dataset.available_textures:
-            s, e = self.dataset.canonical_channel_slices["diffuse"]
-            direct = self.model.render_direct_diffuse_mip(mip, mip_height, mip_width)
-            out[:, :, s:e] = direct.squeeze(0).permute(1, 2, 0).to(out.dtype)
-        return out
-
-    def _downsample_for_metrics(self, pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Area-downsample for PSNR/SSIM/LPIPS when the plane is large."""
-        max_edge = self.eval_metrics_max_edge
-        if max_edge <= 0:
-            return pred, gt
-        _, _, h, w = pred.shape
-        edge = max(h, w)
-        if edge <= max_edge:
-            return pred, gt
-        scale = max_edge / float(edge)
-        nh = max(1, int(round(h * scale)))
-        nw = max(1, int(round(w * scale)))
-        return (
-            F.interpolate(pred, size=(nh, nw), mode="area"),
-            F.interpolate(gt, size=(nh, nw), mode="area"),
-        )
+    def _fill_predicted_mip(self, mip, mip_height, mip_width, model=None):
+        model = self.model if model is None else model
+        base = None
+        if mip == 0 and self.super_resolution_enable and (model._decoder_adaptation_features is not None
+                                                         or getattr(model, '_compressed_material', False)):
+            size = comparison_material_size(model, mip_height, mip_width, self.ref_astc_resolution)
+            base = cached_astc_base(self.dataset, self.astc_codec,
+                                    self.configs.super_resolution_base_resolution, size)
+        return render_material_mip(
+            model, getattr(self, 'dataset', None), mip, mip_height, mip_width, num_mips=self.num_mips, device=self.device,
+            inference_tile=self.eval_inference_tile, ref_astc_resolution=getattr(self, 'ref_astc_resolution', None),
+            superres_base_override=base)
 
     def _mip_size(self, mip: int) -> Tuple[int, int]:
         return self.texture_height // (2 ** mip), self.texture_width // (2 ** mip)
 
-    def _ensure_visual_dirs(self, root: str) -> None:
-        for vc in self.vis_configs:
-            os.makedirs(os.path.join(root, vc['display_name']), exist_ok=True)
-
-    def _canonical_gt_mip(self, mip: int, mip_height: int, mip_width: int) -> torch.Tensor:
-        gt_slice = self.dataset.mip_cache[mip]
-        gt_canonical = self.dataset.expand_to_canonical(
-            gt_slice.reshape(-1, gt_slice.shape[-1])
-        ).reshape(mip_height, mip_width, -1)
-        return gt_canonical.permute(2, 0, 1)[None, ...]
-
     @torch.no_grad()
-    def _render_mip_pair(self, mip: int) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
-        mip_height, mip_width = self._mip_size(mip)
-        pred_hwc = self._fill_predicted_mip(mip, mip_height, mip_width).clamp(0, 1)
-        pred = pred_hwc.permute(2, 0, 1)[None, ...]
-        gt = self._canonical_gt_mip(mip, mip_height, mip_width)
-        return pred, gt, mip_height, mip_width
-
-    def _metric_rgb_pair(self, pred: torch.Tensor, gt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        ms, me = self._get_metrics_slice()
-        pred_rgb = pred[:, ms:me, :, :]
-        pred_rgb = torch.nan_to_num(pred_rgb.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        gt_rgb = gt[:, ms:me, :, :]
-        return self._downsample_for_metrics(pred_rgb, gt_rgb)
-
-    def _metric_texture_name(self) -> str:
-        return "diffuse" if "diffuse" in self.dataset.available_textures else self.dataset.available_textures[0]
-
-    def _metric_visual_pair(self, pred_ref: torch.Tensor, gt_ref: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        if self._metric_texture_name() == "normal":
-            pred_ref = decode_normal(pred_ref, self.normal_encoding)
-            gt_ref = decode_normal(gt_ref, self.normal_encoding)
-        return pred_ref, gt_ref
-
-    def _compute_mip_metrics(
-        self,
-        pred: torch.Tensor,
-        gt: torch.Tensor,
-        mip_height: int,
-        mip_width: int,
-    ) -> Tuple[float, float, Optional[float]]:
-        pred_ref, gt_ref = self._metric_rgb_pair(pred, gt)
-        if self._metric_texture_name() == "normal":
-            psnr_value = float(normal_angular_psnr(pred_ref, gt_ref, self.normal_encoding).item())
-        else:
-            psnr_value = float(self.psnr(pred_ref, gt_ref).item())
-        visual_pred, visual_gt = self._metric_visual_pair(pred_ref, gt_ref)
-        ssim_value, _ = self.ssim(visual_pred, visual_gt)
-        ssim_value = float(ssim_value.item())
-        if mip_height >= 128 and mip_width >= 128:
-            if visual_pred.shape[1] == 1:
-                visual_pred = visual_pred.repeat(1, 3, 1, 1)
-                visual_gt = visual_gt.repeat(1, 3, 1, 1)
-            elif visual_pred.shape[1] == 2:
-                visual_pred = visual_pred[:, :1].repeat(1, 3, 1, 1)
-                visual_gt = visual_gt[:, :1].repeat(1, 3, 1, 1)
-            return psnr_value, ssim_value, float(self.lpips(visual_pred, visual_gt).item())
-        return psnr_value, ssim_value, None
+    def _render_mip_pair(self, mip, model=None):
+        height, width = self._mip_size(mip)
+        pred = self._fill_predicted_mip(mip, height, width, model).clamp(0, 1).permute(2, 0, 1)[None]
+        return pred, canonical_gt_mip(self.dataset, mip), height, width
 
     def _compute_material_metrics(
         self, pred: torch.Tensor, gt: torch.Tensor
@@ -856,36 +633,15 @@ class Trainer(ASTCAwareTrainer):
             eval_weights=self.eval_weights,
         )
 
-    def _save_mip_visuals(self, pred: torch.Tensor, gt: torch.Tensor, output_root: str, filename: str) -> None:
-        save_image = torch.cat([pred, gt], dim=3).squeeze()
-        for vc in self.vis_configs:
-            s, e = vc['canonical_channel_slice']
-            tex_image = self._postprocess_for_vis(save_image[s:e, ...], vc['vis_mode'])
-            save_path = os.path.join(output_root, vc['display_name'], filename)
-            TF.to_pil_image(tex_image).save(save_path)
-
-    @contextlib.contextmanager
-    def _compressed_material(self):
-        """Use an isolated deployment model for material exports and their metrics."""
-        source = self.model
-        decoded = copy.deepcopy(source).eval()
-        decoded.simulate_quantize()
-        apply_astc_to_feature_grids(decoded, self.astc_codec.roundtrip_rgba)
-        decoded._decoder_adaptation_features = None
-        decoded._compressed_material = True
-        self.model = decoded
-        try:
-            yield
-        finally:
-            self.model = source
+    def _save_mip_visuals(self, pred, gt, output_root, filename):
+        save_material_visuals(pred, gt, output_root, filename, self.vis_configs, self.normal_encoding)
 
     @torch.no_grad()
     def save_compressed_materials(self, output_root, iteration):
-        self._ensure_visual_dirs(output_root)
-        with self._compressed_material():
-            for mip in self._infer_mips():
-                pred, gt, _, _ = self._render_mip_pair(mip)
-                self._save_mip_visuals(pred, gt, output_root, f'{iteration}_{mip}.png')
+        decoded = make_deployment_model(self.model, self.astc_codec)
+        for mip in self._infer_mips():
+            pred, gt, _, _ = self._render_mip_pair(mip, decoded)
+            self._save_mip_visuals(pred, gt, output_root, f'{iteration}_{mip}.png')
 
     @staticmethod
     def _mean_metric(values: List[float]) -> float:
@@ -906,27 +662,8 @@ class Trainer(ASTCAwareTrainer):
                     checkpoint_iteration=checkpoint_iteration,
                     selected_iteration=selected)
 
-    def _material_records(self, metrics, mip, height, width, storage):
-        method = (f'fntc_astc_{self.astc_block}' if (self.model._decoder_adaptation_features is not None
-                                                    or getattr(self.model, '_compressed_material', False))
-                  else 'fntc_quantized')
-        return metric_records(metrics, method_label(method), mip=mip, storage_bytes=storage[method],
-                              lpips_available=min(height, width) >= 128)
-
-    def _write_material_metrics(self, directory, records, storage, iteration=None):
-        size = comparison_material_size(self.model, self.texture_height, self.texture_width,
-                                        self.ref_astc_resolution)
-        return write_metrics(directory, records, evaluation='material', iteration=iteration,
-                             metadata=dict(self._metrics_context(iteration),
-                                           gt_size=[self.texture_height, self.texture_width],
-                                           inference_size=list(size), normal_encoding=self.normal_encoding,
-                                           channel_weights=self.eval_weights,
-                                           storage_bytes={method_label(name): value for name, value in storage.items()},
-                                           mip_aggregation='arithmetic_mean_of_mip_group_scores'))
-
     @torch.no_grad()
     def eval(self, curr_iter) -> float:
-        self._ensure_visual_dirs(self.media_path)
         self._cuda_trim_eval_mem(synchronize=True)
 
         psnr_list: List[float] = []
@@ -965,15 +702,13 @@ class Trainer(ASTCAwareTrainer):
                         f'Material/{group_name}/LPIPS_Mip{mip}/train', group_lpips, curr_iter
                     )
 
-                if should_save_visuals:
-                    with self._compressed_material():
-                        compressed, gt, _, _ = self._render_mip_pair(mip)
-                    self._save_mip_visuals(compressed, gt, self.media_path, f"{curr_iter}_{mip}.png")
-
         finally:
             self._restore_feature_grid_state(feature_grid_backup)
             self.model.train(was_training)
             self._cuda_trim_eval_mem(synchronize=False)
+
+        if should_save_visuals:
+            self.save_compressed_materials(self.media_path, curr_iter)
 
         psnr_avg = self._mean_metric(psnr_list)
         ssim_avg = self._mean_metric(ssim_list)
@@ -985,50 +720,26 @@ class Trainer(ASTCAwareTrainer):
         print(f"Iter:{curr_iter}, MaterialPSNR:{psnr_avg:.4f}. {self._loss_stats_str()}")
         return psnr_avg
 
-    def _postprocess_for_vis(self, image: torch.Tensor, vis_mode: str) -> torch.Tensor:
-        """Apply visualization post-processing based on vis_mode.
-        Args:
-            image: [C, H, W] tensor in [0, 1]
-            vis_mode: 'srgb' | 'normal' | 'linear'
-        """
-        image = torch.clamp(image, 0.0, 1.0)
-        if vis_mode == 'srgb':
-            image = torch.pow(image, 1.0 / 2.2)
-        elif vis_mode == 'normal':
-            n = image * 2.0 - 1.0
-            norm = torch.sqrt(torch.clamp((n ** 2).sum(dim=0, keepdim=True), min=1e-8))
-            n = n / norm
-            image = torch.clamp((n + 1.0) * 0.5, 0.0, 1.0)
-        elif vis_mode == 'normal_encoded':
-            image = decode_normal(image, self.normal_encoding)
-        # 'linear' -> no transform
-        return image
-
-    def _get_metrics_slice(self):
-        """Return (start, end) channel indices in canonical 11-channel space for metrics.
-        Prefers 'diffuse' (0:3); falls back to the first available texture's canonical slice.
-        """
-        canon = self.dataset.canonical_channel_slices
-        if 'diffuse' in self.dataset.available_textures:
-            return canon['diffuse']
-        first = self.dataset.available_textures[0]
-        return canon[first]
+    def _postprocess_for_vis(self, image, vis_mode):
+        return postprocess_material(image, vis_mode, self.normal_encoding)
 
     def _infer_mips(self) -> range:
         return inference_mips(self.num_mips, self.mip0_only)
 
     @torch.no_grad()
     def infer(self) -> None:
-        self._ensure_visual_dirs(self.infer_path)
         records = []
         storage = log_comparison_storage(self.model, self.dataset, self.astc_block,
                                          self.ref_astc_resolution, verbose=False)
-        with self._compressed_material():
-            for mip in self._infer_mips():
-                pred, gt, mip_height, mip_width = self._render_mip_pair(mip)
-                material_metrics = self._compute_material_metrics(pred, gt)
-                records.extend(self._material_records(material_metrics, mip, mip_height, mip_width, storage))
-                self._save_mip_visuals(pred, gt, self.infer_path, f"Mip_{mip}.png")
+        decoded = make_deployment_model(self.model, self.astc_codec)
+        for mip in self._infer_mips():
+            pred, gt, mip_height, mip_width = self._render_mip_pair(mip, decoded)
+            material_metrics = self._compute_material_metrics(pred, gt)
+            records.extend(metric_records(material_metrics, method_label(f'fntc_astc_{self.astc_block}'),
+                                          mip=mip, storage_bytes=storage[f'fntc_astc_{self.astc_block}'],
+                                          lpips_available=min(mip_height, mip_width) >= 128))
+            self._save_mip_visuals(pred, gt, self.infer_path, f"Mip_{mip}.png")
+        del decoded
         averages = [row for row in records if row['group'] == 'average']
         if len(averages) > 1:
             values = tuple(self._mean_metric([row[key] for row in averages])
@@ -1039,7 +750,9 @@ class Trainer(ASTCAwareTrainer):
                                      lpips_available=values[2] is not None)[0]
             summary['psnr_type'] = 'mean_across_mips'
             records.append(summary)
-        self._write_material_metrics(self.infer_path, records, storage)
+        write_material_metrics(
+            self.infer_path, records, storage, self.model, self.dataset, self.ref_astc_resolution,
+            self.eval_weights, report_context=self._metrics_context())
 
         if self.enable_astc_compare:
             self.run_astc_comparison(output_root=self.infer_path)
@@ -1075,103 +788,37 @@ class Trainer(ASTCAwareTrainer):
         )
 
     @torch.no_grad()
-    def run_pbr_comparison(self, curr_iter: int = None, output_root: str = None,
-                           return_metrics: bool = False, report_context=None, save_outputs=True):
-        """Render the inferred and source Mip0 texture sets in one fixed PBR scene."""
-        if output_root is None:
-            output_root = self.infer_path if hasattr(self, "infer_path") else self.media_path
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            ref_h, ref_w = comparison_material_size(
-                self.model, self.texture_height, self.texture_width, self.ref_astc_resolution)
-            reference = comparison_reference(self.dataset, self.astc_codec, ref_h, ref_w)
-            gt = reference['gt']
-            fntc_astc_model = copy.deepcopy(self.model).eval()
-            fntc_astc_model.simulate_quantize()
-            apply_astc_to_feature_grids(fntc_astc_model, self.astc_codec.roundtrip_rgba)
-            astc_base = None
-            if self.super_resolution_enable:
-                astc_base = cached_astc_base(
-                    self.dataset,
-                    self.astc_codec,
-                    int(self.configs.super_resolution_base_resolution),
-                    output_size=(ref_h, ref_w),
-                )
-            fntc_astc = _render_model_mip0(
-                fntc_astc_model,
-                self.dataset,
-                self.texture_height,
-                self.texture_width,
-                self.num_mips,
-                self.device,
-                superres_base_override=astc_base,
-                inference_tile=self.eval_inference_tile,
-                inference_size=(ref_h, ref_w),
-            )
-            traditional_astc = reference['astc']
-            storage = log_comparison_storage(self.model, self.dataset, self.astc_block,
-                                             self.ref_astc_resolution, verbose=False)
-            context = {
-                **self._metrics_context(curr_iter), **(report_context or {}),
-                'gt_size': [self.texture_height, self.texture_width], 'inference_size': [ref_h, ref_w],
-                'storage_bytes': {
-                    method_label('fntc', self.astc_block): storage[f'fntc_astc_{self.astc_block}'],
-                    method_label('astc', self.astc_block): storage[f'ref_astc_{self.astc_block}'],
-                    'GT': storage['gt'],
-                },
-            }
-            path, metrics = save_pbr_comparison(
-                fntc_astc_texture=fntc_astc,
-                traditional_astc_texture=traditional_astc,
-                gt_texture=gt,
-                dataset=self.dataset,
-                output_root=output_root,
-                curr_iter=curr_iter,
-                resolution=self.pbr_render_resolution,
-                detail_resolution=self.configs.pbr_detail_resolution,
-                astc_block=self.astc_block,
-                ssim_metric=self.ssim,
-                lpips_metric=self.lpips,
-                mip_lod_bias=self.pbr_mip_lod_bias,
-                lighting=self.pbr_lighting,
-                detail_center=self.configs.pbr_detail_center,
-                detail_zoom=self.configs.pbr_detail_zoom,
-                reference_cache=reference['pbr'],
-                report_context=context,
-                save_outputs=save_outputs,
-            )
-            if curr_iter is not None:
-                for method, (psnr, ssim, lpips) in metrics.items():
-                    self.writer.add_scalar(f"PBRCompare/{method}_PSNR", psnr, curr_iter)
-                    self.writer.add_scalar(f"PBRCompare/{method}_SSIM", ssim, curr_iter)
-                    self.writer.add_scalar(f"PBRCompare/{method}_LPIPS", lpips, curr_iter)
-            return (path, metrics) if return_metrics else path
-        finally:
-            self.model.train(was_training)
+    def run_pbr_comparison(self, curr_iter=None, output_root=None, return_metrics=False,
+                           report_context=None, save_outputs=True):
+        output_root = output_root or getattr(self, 'infer_path', self.media_path)
+        path, metrics = run_pbr_comparison_pipeline(
+            self.model, self.dataset, self.astc_codec, self.configs, output_root, curr_iter=curr_iter,
+            ssim_metric=self.ssim, lpips_metric=self.lpips, lighting=self.pbr_lighting,
+            report_context={**self._metrics_context(curr_iter), **(report_context or {})}, save_outputs=save_outputs)
+        if curr_iter is not None:
+            for method, values in metrics.items():
+                for name, value in zip(('PSNR', 'SSIM', 'LPIPS'), values):
+                    self.writer.add_scalar(f'PBRCompare/{method}_{name}', value, curr_iter)
+        return (path, metrics) if return_metrics else path
 
-    def _write_resolved_config(self, configs: Config) -> None:
-        """Persist scalar/list/dict config values so log analyzers can recover run settings."""
-        out = {}
-        for key, value in vars(configs).items():
-            if key.startswith("_"):
-                continue
-            if isinstance(value, (str, int, float, bool)) or value is None:
-                out[key] = value
-            elif isinstance(value, (list, tuple, dict)):
-                try:
-                    json.dumps(value)
-                    out[key] = value
-                except TypeError:
-                    out[key] = str(value)
-        path = os.path.join(self.save_path, "resolved_config.json")
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=2, sort_keys=True)
-        print(f"resolved_config: {path}")
+    def _write_resolved_config(self, configs):
+        write_resolved_config(configs, self.save_path)
 
     def generate_probabilities(self) -> torch.Tensor:
         # Generate a coarse-to-fine Mip sampling distribution, or isolate Mip0.
         return mip_sampling_probabilities(self.num_mips, self.mip0_only, self.device)
+
+
+def run(params, configs):
+    """Dispatch one run and release its log writer even when training fails."""
+    if configs.multi_stage_training_enable and params.mode == 'train':
+        from Core.Multi_Stage_Training.multi_stage_training import run_multi_stage_training
+        return run_multi_stage_training(params, configs)
+    trainer = Trainer(params, config_override=configs)
+    try:
+        return trainer.train() if params.mode == 'train' else trainer.infer()
+    finally:
+        trainer.writer.close()
 
 
 if __name__ == "__main__":
@@ -1179,11 +826,6 @@ if __name__ == "__main__":
     params = get_args()
 
     configs = Config(params)
-
-    if configs.multi_stage_training_enable and params.mode == "train" and not configs.groups_batching:
-        from Core.Multi_Stage_Training.multi_stage_training import run_multi_stage_training
-        run_multi_stage_training(params, configs)
-        sys.exit(0)
 
     if configs.groups_batching:
         # GroupsBatching mode: iterate over all texture groups sequentially
@@ -1195,17 +837,7 @@ if __name__ == "__main__":
             print(f"{'='*60}")
             group_cfg = configs.make_group_config(group_name)
             try:
-                if params.mode == "train" and group_cfg.multi_stage_training_enable:
-                    from Core.Multi_Stage_Training.multi_stage_training import run_multi_stage_training
-                    run_multi_stage_training(params, group_cfg)
-                else:
-                    trainer = Trainer(params, config_override=group_cfg)
-                    if params.mode == "train":
-                        trainer.train()
-                    elif params.mode == "infer":
-                        trainer.infer()
-                    else:
-                        raise ValueError("Error mode.")
+                run(params, group_cfg)
             except Exception as e:
                 print(f"[GroupsBatching] ERROR on group '{group_name}': {e}")
                 import traceback
@@ -1226,12 +858,4 @@ if __name__ == "__main__":
             print(f"[GroupsBatching] Exiting with error; failed groups: {', '.join(failed_groups)}", file=sys.stderr)
             sys.exit(1)
     else:
-        # Single-group mode (original behavior)
-        trainer = Trainer(params)
-
-        if params.mode == "train":
-            trainer.train()
-        elif params.mode == "infer":
-            trainer.infer()
-        else:
-            raise ValueError("Error mode.")
+        run(params, configs)

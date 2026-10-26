@@ -2,7 +2,7 @@
 
 import math
 import torch
-from Comparison_ASTC import ASTCCodec, cached_astc_base
+from Common.comparison_astc import ASTCCodec, cached_astc_base
 from .differentiable_proxy import roundtrip_feature_blocks
 from Core.Feature_Grid.sampling import bilinear_repeat, resize_bilinear_repeat
 from dataset import material_size, clean_base_image, native_query_uv, prefiltered_material, sample_material
