@@ -111,6 +111,7 @@ def refit_layout(trainer, steps):
             or trainer.texture_width % model.astc_proxy[0]._image_shape[1]):
         return {'applied': False, 'reason': 'requires one gradient SR codec at native material resolution and integer GT scale'}
     grid, spec = model.astc_proxy[0], model.feature_grid_specs[0]
+    trainer._metrics_phase = 'layout_refit'
     source = model.feature_grids[0].params
     saved_source = source.detach().clone()
     saved_codec = {k: v.detach().clone() for k, v in grid.state_dict().items()}
@@ -123,8 +124,8 @@ def refit_layout(trainer, steps):
     method = 'fntc_astc_' + trainer.astc_block
     stats = {'applied': True, 'steps': steps, 'accepted': False, 'best_step': 0, 'checks': []}
     try:
-        before = trainer.run_astc_comparison(curr_iter=model.current_iter)
-        before_pbr = trainer.run_pbr_comparison(curr_iter=model.current_iter, return_metrics=True)[1] if trainer.enable_pbr_compare else None
+        before = trainer.run_astc_comparison(curr_iter=model.current_iter, verbose=False, save_outputs=False)
+        before_pbr = trainer.run_pbr_comparison(curr_iter=model.current_iter, return_metrics=True, save_outputs=False)[1] if trainer.enable_pbr_compare else None
         best_material, best_pbr = before[method]['average'], before_pbr
         best_codec = saved_codec
         field = source.detach().clone()
@@ -163,8 +164,10 @@ def refit_layout(trainer, steps):
                 local_accepted = _select(trainer, proposal)
                 trainer._sync_astc_source()
                 iteration = model.current_iter + step
-                after = trainer.run_astc_comparison(curr_iter=iteration)[method]['average']
-                after_pbr = trainer.run_pbr_comparison(curr_iter=iteration, return_metrics=True)[1] if before_pbr is not None else None
+                after = trainer.run_astc_comparison(curr_iter=iteration, verbose=False,
+                                                    save_outputs=False)[method]['average']
+                after_pbr = trainer.run_pbr_comparison(curr_iter=iteration, return_metrics=True,
+                                                       save_outputs=False)[1] if before_pbr is not None else None
                 stream = grid.export_astc()
                 changed = sum(saved_stream[i:i+16] != stream[i:i+16] for i in range(16, len(saved_stream), 16))
                 accepted = (_passes(best_material, after)
@@ -182,7 +185,8 @@ def refit_layout(trainer, steps):
                 model.astc_codec_branch_enabled = False
                 model._decoder_adaptation_features = [field]
                 model._qat_param_cache.clear()
-            print(f"[Layout refit] step {step}/{steps}: accepted={accepted}, best_step={stats['best_step']}", flush=True)
+            print(f"[Layout refit] step {step}/{steps}: PSNR={after[0]:.4f}, "
+                  f"accepted={accepted}, best_step={stats['best_step']}", flush=True)
 
         with torch.random.fork_rng(devices=devices):
             evaluate(initial, 0)

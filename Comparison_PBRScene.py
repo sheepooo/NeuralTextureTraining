@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
 from Core.Material_Encoding.normal_encoding import decode_normal
+from Comparison_ASTC import comparison_label_color, method_label, metric_records, write_metrics
 
 
 def _normalize(x: np.ndarray) -> np.ndarray:
@@ -428,8 +429,10 @@ def _annotated_render(image, name, metric=None):
     while draw.multiline_textbbox((0, 0), label, font=font, spacing=3)[2] > panel.width - 44 and getattr(font, 'size', 10) > 10:
         font = ImageFont.truetype(font.path, font.size - 1)
     bbox = draw.multiline_textbbox((0, 0), label, font=font, spacing=3)
-    draw.rounded_rectangle((10, 10, 34 + bbox[2], 30 + bbox[3]), radius=6, fill=(0, 0, 0, 180))
-    draw.multiline_text((22, 20), label, fill=(245, 245, 245), font=font, spacing=3)
+    draw.rounded_rectangle((10, 10, 34 + bbox[2], 30 + bbox[3]), radius=6,
+                           fill=comparison_label_color(name))
+    draw.multiline_text((23, 21), label, fill=(0, 0, 0, 220), font=font, spacing=3)
+    draw.multiline_text((22, 20), label, fill=(255, 255, 255), font=font, spacing=3)
     return Image.alpha_composite(panel, overlay).convert('RGB')
 
 
@@ -453,7 +456,9 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
                         lpips_metric=None, mip_lod_bias: float = -1.0,
                         lighting=None, detail_center=(0.5, 0.62), detail_zoom: float = 4.0,
                         reference_cache=None,
+                        report_context=None,
                         detail_resolution: int = 2048,
+                        save_outputs=True,
                         ) -> Tuple[str, Dict[str, Tuple[float, float, float]]]:
     """Render FNTC-ASTC, traditional ASTC, and GT texture sets in one scene."""
     available = getattr(dataset, "available_textures", None)
@@ -501,15 +506,15 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
                              mode='area')[0].permute(1, 2, 0).numpy()
     fntc_astc = crop
     metric_key = (id(ssim_metric), id(lpips_metric), str(fntc_astc_texture.device))
-    if metric_key not in cache['metrics']:
-        cache['metrics'][metric_key] = {}
-    fixed_metrics = cache['metrics'][metric_key]
+    fixed_metrics = cache['metrics'].setdefault(metric_key, {})
     if 'full' not in fixed_metrics:
         fixed_metrics['full'] = _render_metrics(traditional_astc, gt, fntc_astc_texture.device, ssim_metric, lpips_metric)
     metrics = {
         "fntc": _render_metrics(fntc_astc, gt, fntc_astc_texture.device, ssim_metric, lpips_metric),
         "astc": fixed_metrics['full'],
     }
+    if not save_outputs:
+        return None, metrics
     out_dir = os.path.join(output_root, "Compare_PBRScene")
     if curr_iter is not None:
         out_dir = os.path.join(out_dir, f'iter_{curr_iter:08d}')
@@ -537,9 +542,25 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
     }
     _save_render_panels(detail, detail_metrics, astc_block, out_dir,
                         os.path.join(out_dir, 'comparison_strip_detail.png'), prefix='detail_')
-    with open(os.path.join(out_dir, 'metrics.json'), 'w', encoding='utf-8') as output:
-        json.dump({'full': metrics, 'detail': detail_metrics,
-                   'detail_view': {'center': list(detail_center), 'zoom': detail_zoom,
-                                   'resolution': int(detail_resolution), 'rendered_separately': True}},
-                  output, indent=2)
+    context = report_context or {}
+    records = [row for view, scores in (('Scene', metrics), ('Scene Detail', detail_metrics))
+               for method, values in scores.items()
+               for row in metric_records({'image': values}, method_label(method, astc_block), view=view,
+                                         storage_bytes=context.get('storage_bytes', {}).get(method_label(method, astc_block)))]
+    write_metrics(out_dir, records, evaluation='pbr', iteration=curr_iter,
+                  metadata=dict(context, astc_block=astc_block, normal_encoding=dataset.normal_encoding,
+                                render_sizes={'Scene': list(gt.shape[:2]), 'Scene Detail': list(detail[2].shape[:2])},
+                                mip_lod_bias=mip_lod_bias, lighting=lighting,
+                                detail_view={'center': list(detail_center), 'zoom': detail_zoom,
+                                             'resolution': int(detail_resolution), 'rendered_separately': True}))
+    labels = (f'FNTC_{astc_block.lower()}', f'ASTC_{astc_block.lower()}')
+    label_width = max(map(len, labels))
+    for view, scores, image_path in (
+            ('Scene', metrics, path),
+            ('Scene Detail', detail_metrics, os.path.join(out_dir, 'comparison_strip_detail.png'))):
+        for method, label in zip(('fntc', 'astc'), labels):
+            psnr, ssim, lpips = scores[method]
+            suffix = f'  output={image_path}' if method == 'astc' else ''
+            print(f'[PBR Test] {view} Iter {curr_iter}: {label:<{label_width}} '
+                  f'PSNR={psnr:8.4f}  SSIM={ssim:7.4f}  LPIPS={lpips:7.4f}{suffix}')
     return path, metrics

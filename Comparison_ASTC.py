@@ -7,6 +7,7 @@ full texture resolution; ref_astc_resolution sets the shared FNTC/ASTC material 
 from __future__ import annotations
 
 import copy
+import csv
 import math
 import json
 import os
@@ -17,6 +18,7 @@ import tempfile
 import urllib.request
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -50,7 +52,7 @@ def normalize_astc_block(block: str) -> str:
 
 
 def _ref_astc_hw_from_side(side: Optional[int], base_h: int, base_w: int) -> Tuple[int, int]:
-    """Traditional ASTC baseline: square side×side, or None → Mip0 (base_h, base_w)."""
+    """Scale the longest material edge to side while preserving the GT aspect ratio."""
     if side is None:
         return base_h, base_w
     if side <= 0:
@@ -59,11 +61,55 @@ def _ref_astc_hw_from_side(side: Optional[int], base_h: int, base_w: int) -> Tup
     return max(1, int(round(base_h * scale))), max(1, int(round(base_w * scale)))
 
 
-
 def comparison_material_size(model, height: int, width: int, ref_astc_resolution=None):
     """Shared FNTC/ASTC raster, independent of latent resolution when specified."""
     edge = ref_astc_resolution or max(material_size(model, height, width))
     return _ref_astc_hw_from_side(edge, height, width)
+
+
+def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None, verbose=True,
+                           deployment_config=None):
+    """Log Mip0 deployment payloads, excluding SR base and file containers."""
+    block = normalize_astc_block(block)
+    block_w, block_h = map(int, block.split('x'))
+
+    def astc_bytes(height, width):
+        return math.ceil(height / block_h) * math.ceil(width / block_w) * 16
+
+    latent = uncompressed_latent = 0
+    for index, spec in enumerate(model.feature_grid_specs):
+        channels = spec.n_features_per_level
+        maps = math.ceil(channels / 4)
+        if model.direct_diffuse_enabled and index == 0 and channels >= 3:
+            maps = 1 + math.ceil((channels - 3) / 4)
+        latent += maps * astc_bytes(spec.max_resolution, spec.max_resolution)
+        # model.save exports one RGBA8 DDS per grid, including unused channel padding.
+        uncompressed_latent += spec.max_resolution ** 2 * 4
+    decoder, cnn = model.decoder_storage_bytes(deployment_config)
+    height, width = dataset.texture_height, dataset.texture_width
+    ref_h, ref_w = comparison_material_size(model, height, width, ref_astc_resolution)
+    maps = len(dataset.texture_packing)
+    channels = sum(dataset.canonical_channel_slices[name][1] - dataset.canonical_channel_slices[name][0]
+                   for name in dataset.available_textures)
+    rows = (
+        ('FNTC', latent + decoder + cnn,
+         f'latent ASTC={latent:,} B + decoder={decoder:,} B + material CNN={cnn:,} B; SR base excluded'),
+        ('ASTC', maps * astc_bytes(ref_h, ref_w),
+         f'{ref_w}x{ref_h}, {maps} packed maps, {block} blocks'),
+        ('GT', height * width * channels,
+         f'{width}x{height}, {channels} effective channels, UNORM8'),
+    )
+    if verbose:
+        byte_width = max(len(f'{size:,}') for _, size, _ in rows)
+        for name, size, details in rows:
+            print(f'[Storage] {name:<4} total={size:>{byte_width},} B ({size / 1024:>10.2f} KiB) '
+                  f'| {details}; Mip0 payload only')
+    return {
+        'fntc_quantized': uncompressed_latent + decoder + cnn,
+        f'fntc_astc_{block}': latent + decoder + cnn,
+        f'ref_astc_{block}': maps * astc_bytes(ref_h, ref_w),
+        'gt': height * width * channels,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -322,6 +368,65 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
 # Metrics (per texture family + average)
 # ---------------------------------------------------------------------------
 
+METRIC_FIELDS = ('iteration', 'method', 'view', 'mip', 'group', 'psnr_type',
+          'psnr', 'ssim', 'lpips', 'lpips_status', 'storage_bytes')
+
+
+def method_label(method, block=None):
+    if method == 'fntc_quantized':
+        return 'FNTC_uncompressed'
+    if method == 'gt':
+        return 'GT'
+    if method.startswith('fntc_astc_'):
+        return f'FNTC_{method.removeprefix("fntc_astc_")}_compressed'
+    if method.startswith('ref_astc_'):
+        return f'ASTC_{method.removeprefix("ref_astc_")}_compressed'
+    if method in ('fntc', 'astc') and block is not None:
+        return f'{method.upper()}_{block}'
+    return method
+
+
+def metric_records(metrics, method, *, view='Material', mip=0, storage_bytes=None,
+                   lpips_available=True):
+    records = []
+    for group, values in metrics.items():
+        psnr, ssim, lpips = (float(v) if v is not None and math.isfinite(v) else None for v in values)
+        records.append(dict(method=method, view=view, mip=mip, group=group,
+                            psnr_type=('normal_angular' if group == 'normal' else
+                                       'weighted_group_mean' if group == 'average' else 'image_mse'),
+                            psnr=psnr, ssim=ssim, lpips=lpips if lpips_available else None,
+                            lpips_status=('not_computed' if not lpips_available else
+                                          'computed' if lpips is not None else 'nonfinite'),
+                            storage_bytes=storage_bytes))
+    return records
+
+
+def write_metrics(directory, records, *, evaluation, iteration=None, metadata=None):
+    """JSON retains full precision/context; CSV has the same rows and named columns."""
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    records = [dict(row, iteration=iteration) for row in records]
+    report = dict(schema_version=1, evaluation=evaluation, iteration=iteration,
+                  storage_scope=dict(unit='bytes', mip=0, sr_base_included=False, container_overhead_included=False),
+                  metric_definitions={
+                      'psnr': 'dB; psnr_type distinguishes image MSE, normal angular error and group mean; exact image matches report 120 dB',
+                      'normal': 'PSNR: angular error in degrees (range 180); SSIM/LPIPS: decoded normal RGB',
+                      'average': 'weighted mean of group scores, using the sum of effective channel weights',
+                      'romsd_lpips': 'mean of per-scalar LPIPS, each scalar replicated to RGB',
+                      'lpips_status': 'not_computed is null in JSON and empty in CSV; never a perfect score',
+                      'storage': 'bytes; Mip0 deployment payload; SR base and file containers excluded',
+                  }, metadata=metadata or {}, records=records)
+    text = json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + '\n'
+    (directory/'metrics.json').write_text(text, encoding='utf-8')
+    with (directory/'metrics.csv').open('w', encoding='utf-8', newline='') as output:
+        writer = csv.DictWriter(output, fieldnames=METRIC_FIELDS)
+        writer.writeheader()
+        for row in records:
+            writer.writerow({key: f'{value:.6f}' if isinstance(value, float) else value
+                             for key, value in row.items()})
+    return report
+
+
 def _compute_ssim_safe(pred_ref: torch.Tensor, gt_ref: torch.Tensor, ssim_metric) -> float:
     ssim_metric.reset()
     pred_ref = torch.nan_to_num(pred_ref.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
@@ -358,6 +463,8 @@ def _compute_metrics_from_refs(
         psnr_metric.reset()
         psnr_value = float(psnr_metric(pred_ref, gt_ref).item())
         psnr_metric.reset()
+        if psnr_value == math.inf:
+            psnr_value = 120.0
     if not math.isfinite(psnr_value):
         psnr_value = 0.0
     ssim_value = _compute_ssim_safe(pred_ref, gt_ref, ssim_metric)
@@ -450,7 +557,7 @@ def _compute_group_metrics(pred_image, gt_image, dataset, psnr_metric, ssim_metr
 
 def _metric_labels(metric_group: Optional[str] = None) -> Tuple[str, str, str]:
     if metric_group == "normal":
-        return "AngularPSNR", "AngularSSIM", "AngularLPIPS"
+        return "AngularPSNR", "SSIM", "LPIPS"
     return "PSNR", "SSIM", "LPIPS"
 
 
@@ -461,13 +568,14 @@ def _format_metric_triplet(
     psnr_label, ssim_label, lpips_label = _metric_labels(metric_group)
     if metric is None:
         return f"{psnr_label}:{'-':>8}  {ssim_label}:{'-':>7}  {lpips_label}:{'-':>7}"
-    return f"{psnr_label}:{metric[0]:8.3f}  {ssim_label}:{metric[1]:7.4f}  {lpips_label}:{metric[2]:7.4f}"
+    lpips_text = f'{metric[2]:7.4f}' if metric[2] is not None else f'{"N/A":>7}'
+    return f"{psnr_label}:{metric[0]:8.3f}  {ssim_label}:{metric[1]:7.4f}  {lpips_label}:{lpips_text}"
 
 
-def _print_comparison_metrics(metrics, display_labels):
+def _print_comparison_metrics(metrics, display_labels, curr_iter=None):
     label_width = max(len(label) for label in display_labels.values())
     for method, values in metrics.items():
-        print(f"[ASTC Test] {display_labels[method]:<{label_width}} Weighted {_format_metric_triplet(values.get('average'))} "
+        print(f"[ASTC Test] {display_labels[method]:<{label_width}} Iter {curr_iter}: Weighted {_format_metric_triplet(values.get('average'))} "
               f"(Diffuse {_format_metric_triplet(values.get('diffuse'))}, "
               f"NormalAngular {_format_metric_triplet(values.get('normal'))}, "
               f"ROMSD {_format_metric_triplet(values.get('romsd'))})")
@@ -508,6 +616,20 @@ def _concat_pil_h(images: list) -> Image.Image:
     return out
 
 
+def comparison_label_color(method_name: str):
+    """Shared method colors for material and PBR comparison annotations."""
+    name = method_name.lower()
+    if name in ('fntc_quantized', 'fntc_uncompressed'):
+        return (46, 196, 255, 140)
+    if name.startswith('fntc_'):
+        return (255, 181, 71, 140)
+    if name.startswith(('ref_astc_', 'astc_')):
+        return (255, 99, 146, 140)
+    if name == 'gt':
+        return (127, 255, 127, 140)
+    return (120, 120, 255, 140)
+
+
 def _make_annotated_tile(
     tile: torch.Tensor,
     method_name: str,
@@ -546,21 +668,10 @@ def _make_annotated_tile(
     box_h = text_bbox[3] - text_bbox[1] + pad * 2
     box_x, box_y = pad, pad
 
-    if method_name == "fntc_quantized":
-        box_color = (46, 196, 255, 140)
-    elif method_name.startswith("fntc_astc_"):
-        box_color = (255, 181, 71, 140)
-    elif method_name.startswith("ref_astc_"):
-        box_color = (255, 99, 146, 140)
-    elif method_name == "gt":
-        box_color = (127, 255, 127, 140)
-    else:
-        box_color = (120, 120, 255, 140)
-
     draw.rounded_rectangle(
         (box_x, box_y, min(w - pad, box_x + box_w), min(h - pad, box_y + box_h)),
         radius=max(4, font_size // 5),
-        fill=box_color,
+        fill=comparison_label_color(method_name),
     )
     text_x, text_y = box_x + pad, box_y + pad
     draw.multiline_text((text_x + 1, text_y + 1), text, fill=(0, 0, 0, 220), font=font, spacing=spacing)
@@ -742,15 +853,20 @@ def run_astc_comparison_pipeline(
     ref_astc_resolution: Optional[int] = None,
     eval_weights=None,
     inference_tile: int = 512,
+    verbose: bool = True,
+    report_context=None,
+    save_outputs=True,
 ) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
     block_tag = astc_codec.astc_block.lower()
+    storage = log_comparison_storage(model, dataset, astc_codec.astc_block, ref_astc_resolution, verbose=False)
     fntc_astc_name = f"fntc_astc_{astc_codec.astc_block}"
     ref_astc_name = f"ref_astc_{astc_codec.astc_block}"
 
     compare_root = os.path.join(output_root, f"Compare_ASTC{block_tag}")
     if curr_iter is not None:
         compare_root = os.path.join(compare_root, f"iter_{curr_iter:08d}")
-    os.makedirs(compare_root, exist_ok=True)
+    if save_outputs:
+        os.makedirs(compare_root, exist_ok=True)
 
     h0, w0 = texture_height, texture_width
     feature_resolutions = []
@@ -763,14 +879,13 @@ def run_astc_comparison_pipeline(
     reference = comparison_reference(dataset, astc_codec, ref_h, ref_w)
     gt_image = reference['gt'].to(device)
     native_h, native_w = ref_h, ref_w
-    with open(os.path.join(compare_root, 'reconstruction.json'), 'w', encoding='utf-8') as output:
-        json.dump({'gt_size': [h0, w0], 'fntc_material_size': [native_h, native_w],
+    if save_outputs:
+        with open(os.path.join(compare_root, 'reconstruction.json'), 'w', encoding='utf-8') as output:
+            json.dump({'gt_size': [h0, w0], 'fntc_material_size': [native_h, native_w],
                    'astc_material_size': [ref_h, ref_w], 'feature_grid_resolutions': feature_resolutions,
                    'upsampler': 'bilinear_repeat' if (ref_h, ref_w) != (h0, w0) else None,
                    'texture_packing': dataset.texture_packing,
                    'texel_centers': True, 'decoder_queries': native_h * native_w}, output, indent=2)
-    if (ref_h, ref_w) != (h0, w0):
-        print(f"[ASTC Test] {ref_astc_name} encode/decode at {ref_h}x{ref_w}, aligned to Mip0 {h0}x{w0} for metrics")
 
     quant_model = copy.deepcopy(model)
     quant_model.simulate_quantize()
@@ -811,36 +926,24 @@ def run_astc_comparison_pipeline(
         ),
         ref_astc_name: copy.deepcopy(reference['metrics'][metric_key]),
     }
-    metrics_path = os.path.join(compare_root, f"metrics_astc_{astc_codec.astc_block}.txt")
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        group_order = ("diffuse", "normal", "romsd", "average")
-        method_width = max(len(name) for name in metrics)
-        for method_name, method_metrics in metrics.items():
-            for group_name in group_order:
-                if group_name not in method_metrics:
-                    continue
-                p, s, l = method_metrics[group_name]
-                metric_name = "normal_angular" if group_name == "normal" else group_name
-                labels = _metric_labels("normal" if group_name == "normal" else None)
-                f.write(f"{method_name:<{method_width}} {metric_name:<14} {labels[0]:<12} {p:12.6f} "
-                        f"{labels[1]:<12} {s:10.6f} {labels[2]:<12} {l:10.6f}\n")
-
-    display_labels = {}
-    for method_name in metrics:
-        if method_name == "fntc_quantized":
-            display_name = "FNTC_uncompressed"
-        elif method_name == fntc_astc_name:
-            display_name = f"FNTC_{astc_codec.astc_block}_compressed"
-        elif method_name == ref_astc_name:
-            display_name = f"ASTC_{astc_codec.astc_block}_compressed"
-            source_text = f"{ref_w}x{ref_h}x3"
-        else:
-            display_name = method_name
-            source_text = "unknown"
-        if method_name != ref_astc_name:
-            source_text = f"material={native_w}x{native_h},GT={w0}x{h0}"
-        display_labels[method_name] = f"{display_name}[{source_text}]"
-    _print_comparison_metrics(metrics, display_labels)
+    if not save_outputs:
+        return metrics
+    records = [row for method, groups in metrics.items()
+               for row in metric_records(groups, method_label(method), storage_bytes=storage[method],
+                                         lpips_available=min(h0, w0) >= 128)]
+    write_metrics(compare_root, records, evaluation='astc', iteration=curr_iter,
+                  metadata=dict(report_context or {}, astc_block=astc_codec.astc_block,
+                                gt_size=[h0, w0], inference_size=[ref_h, ref_w],
+                                normal_encoding=dataset.normal_encoding,
+                                group_weights=_group_metric_weights(dataset, eval_weights),
+                                storage_bytes={method_label(name): value for name, value in storage.items()},
+                                feature_grid_resolutions=feature_resolutions))
+    display_labels = {method: f'{method_label(method)}[{storage[method]:,} B]' for method in metrics}
+    display_metrics = {method: {group: (p, s, l if min(h0, w0) >= 128 else None)
+                               for group, (p, s, l) in groups.items()}
+                       for method, groups in metrics.items()}
+    if verbose:
+        _print_comparison_metrics(display_metrics, display_labels, curr_iter)
 
     _save_comparison_strip(
         pred_fntc=pred_fntc,
@@ -848,7 +951,7 @@ def run_astc_comparison_pipeline(
         pred_traditional_astc=pred_traditional_astc,
         gt_image=gt_image,
         compare_root=compare_root,
-        metrics=metrics,
+        metrics=display_metrics,
         fntc_astc_name=fntc_astc_name,
         ref_astc_name=ref_astc_name,
         vis_configs=vis_configs,

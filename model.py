@@ -129,11 +129,12 @@ class TCNNModel(torch.nn.Module):
         tile_size = max(1, int(getattr(config, "pos_encoding_tile_size", 8)))
         tile_uv = float(tile_size) / float(max(1, reference_edge))
         self.pos_encoding_tile_uv = tile_uv
+        self.pos_encoding_type = "tiled_sincos"
+        self.pos_encoding_tile_size = tile_size
+        self.pos_encoding_reference_size = tuple(getattr(config, "material_reconstruction_size",
+                                                        (reference_edge, reference_edge)))
         self.positional_encoding = TiledPositionalEncoding(
-            n_frequencies=config.n_frequencies,
-            tile_uv=tile_uv,
-            device=self.device,
-        )
+            n_frequencies=config.n_frequencies, tile_uv=tile_uv, device=self.device)
 
         # how many mips to sample per query
         self.num_sampled_mips = 1
@@ -183,18 +184,6 @@ class TCNNModel(torch.nn.Module):
 
             print(f"Initialized feature grid: max_res={max_res}, base_res={base_res}, n_levels={n_levels}, n_features_per_level={n_feature_per_level}, quantize_bits={qbits}, save_bits={sbits}, interpolation={spec.interpolation}")
 
-        # Hidden layers still rely on tiny-cuda-nn's native activation.
-        # Output activation is applied manually in forward() and can be configured as:
-        # hard_swish (default), hard_gelu, or leaky_relu.
-        hidden_activation = "LeakyReLU" if config.n_hidden_layers > 0 else "None"
-        network_config = {
-            #"otype": "FullyFusedMLP",
-            "otype": "CutlassMLP",
-            "activation": hidden_activation,
-            "output_activation": "None",
-            "n_neurons": config.n_neurons,
-            "n_hidden_layers": config.n_hidden_layers
-        }
         total_grid_features = sum(self.feature_grid_n_features_per_level) * self.num_sampled_mips
         total_grid_features *= 1 + self.feature_gradient_count
         self.material_cnn = None
@@ -206,16 +195,10 @@ class TCNNModel(torch.nn.Module):
         if self.direct_diffuse_enabled:
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
                 raise ValueError("direct_diffuse_infer_mode requires feature grid 0 to have at least 3 channels")
-        superres_input_dims = self.num_channels if self.super_resolution_enable else 0
         # tiny-cuda-nn CutlassMLP exposes one flat weight tensor and ignores
         # use_bias. Append a constant input explicitly to provide a real bias.
-        n_input_dims = self.positional_encoding.n_output_dims + total_grid_features + superres_input_dims + 2
-        print(f"total_grid_features={total_grid_features}, n_input_dims={n_input_dims}")
-        self.network = tcnn.Network(
-            n_input_dims=n_input_dims,
-            n_output_dims=self.num_channels,
-            network_config=network_config,
-        )
+        self.network = self._create_decoder(config, self.positional_encoding.n_output_dims)
+        print(f"total_grid_features={total_grid_features}, n_input_dims={self.network.n_input_dims}")
         # CutlassMLP ignores `use_bias` in this tiny-cuda-nn build. The constant
         # input supplies first-layer bias; this parameter supplies output bias.
         self.decoder_output_bias = torch.nn.Parameter(
@@ -239,6 +222,32 @@ class TCNNModel(torch.nn.Module):
         # Squareplus factor=0.95, patience=2000, PSNR=28.57, LPIPS=0., time=20min
         # Squareplus factor=0.85, patience=2000, PSNR=28.60, LPIPS=0.2002, time=20min
         self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.85, patience=2000)
+
+    def _create_decoder(self, config, positional_dims):
+        features = sum(self.feature_grid_n_features_per_level) * self.num_sampled_mips
+        inputs = positional_dims + features * (1 + config.feature_gradient_count) + 2
+        if config.super_resolution_enable:
+            inputs += self.num_channels
+        return tcnn.Network(inputs, self.num_channels, {
+            'otype': 'CutlassMLP', 'activation': 'LeakyReLU' if config.n_hidden_layers else 'None',
+            'output_activation': 'None', 'n_neurons': config.n_neurons,
+            'n_hidden_layers': config.n_hidden_layers,
+        })
+
+    def decoder_storage_bytes(self, deployment_config=None):
+        """Count exported weights without allocating another latent grid or optimizer."""
+        network, cnn = self.network, self.material_cnn
+        if deployment_config is not None:
+            devices = [torch.cuda.current_device()] if self.device == 'cuda' else []
+            with torch.random.fork_rng(devices=devices):
+                # Tiled sin/cos contributes four input channels per frequency.
+                network = self._create_decoder(deployment_config, 4 * deployment_config.n_frequencies)
+                with torch.device('meta'):
+                    cnn = MaterialCNN(self.num_channels) if deployment_config.material_cnn_enable else None
+        decoder = sum(p.numel() * p.element_size() for p in network.parameters())
+        decoder += self.decoder_output_bias.numel() * self.decoder_output_bias.element_size()
+        spatial = sum(p.numel() * p.element_size() for p in cnn.parameters()) if cnn is not None else 0
+        return decoder, spatial
 
     def _hard_swish(self, x: torch.Tensor) -> torch.Tensor:
         """Hard-Swish activation without trig/exp.
@@ -317,6 +326,7 @@ class TCNNModel(torch.nn.Module):
         ckpt_path = os.path.join(ckpt_dir, f"train_result_{ckpt_iter}", "model.pth")
         ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=True)
         self.load_state_dict(ckpt)
+        self.loaded_checkpoint = ckpt_path
 
     @staticmethod
     def _rgb_to_ycocg(rgb: torch.Tensor) -> torch.Tensor:
@@ -607,6 +617,9 @@ class TCNNModel(torch.nn.Module):
 
             save_kwargs = {
                 'info': info,
+                'pos_encoding_type': np.array(self.pos_encoding_type),
+                'pos_encoding_tile_size': np.array(self.pos_encoding_tile_size, dtype=np.int32),
+                'pos_encoding_reference_size': np.array(self.pos_encoding_reference_size, dtype=np.int32),
                 'feature_gradient_count': np.array(self.feature_gradient_count, dtype=np.int32),
                 'astc_proxy': np.array(bool(len(self.astc_proxy)), dtype=np.bool_),
                 'network': save_model.network.state_dict()["params"].numpy(),

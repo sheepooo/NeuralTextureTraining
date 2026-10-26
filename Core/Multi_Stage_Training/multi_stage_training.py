@@ -19,7 +19,7 @@ from .layout import refit_layout
 
 
 def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
-                     early_stop: bool = False):
+                     early_stop: bool = False, final_report: bool = True):
     """Keep source latents intact while fitting their fixed ASTC-decoded inputs."""
     from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
 
@@ -71,7 +71,7 @@ def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
         trainer._reset_training_phase("decoder", trainer.trained_iter)
         trainer.early_stop = early_stop
         model.train()
-        trainer.train()
+        trainer.train(final_report=final_report)
         torch.cuda.synchronize()
         for grid, original in zip(model.feature_grids, source):
             if not torch.equal(grid.params.detach(), original):
@@ -106,6 +106,7 @@ def _record_stage(trainer, stages, name, start_iteration, details):
     """Save one named stage using a common checkpoint and metric schema."""
     model = trainer.model
     iteration = int(model.current_iter)
+    trainer._metrics_phase = name
     model.save(iteration, trainer.model_path)
     astc = trainer.run_astc_comparison(curr_iter=iteration)
     pbr = (trainer.run_pbr_comparison(curr_iter=iteration, return_metrics=True)[1]
@@ -119,6 +120,12 @@ def _record_stage(trainer, stages, name, start_iteration, details):
                   "feature_gradient_count": model.feature_gradient_count,
                   "material_cnn_enable": model.material_cnn is not None},
         "metrics": {"astc": astc, "pbr": pbr}, "details": details,
+        "metric_reports": {
+            "astc": os.path.join(trainer.media_path, f'Compare_ASTC{trainer.astc_block.lower()}',
+                                  f'iter_{iteration:08d}', 'metrics.json'),
+            "pbr": os.path.join(trainer.media_path, 'Compare_PBRScene', f'iter_{iteration:08d}', 'metrics.json')
+                   if trainer.enable_pbr_compare else None,
+        },
     }
     stages.append(record)
     return record
@@ -140,12 +147,12 @@ def run_multi_stage_training(params, config=None):
     representation_config.n_frequencies = 0
     representation_config.feature_gradient_count = 0
     representation_config.material_cnn_enable = False
-    trainer = Trainer(params, config_override=representation_config)
+    trainer = Trainer(params, config_override=representation_config, deployment_config=target)
     stages = []
     try:
         print("[Multi Stage Training] representation: affine decoder, no PE or feature differences", flush=True)
         start = trainer.trained_iter
-        trainer.train()
+        trainer.train(final_report=False)
         representation = _record_stage(trainer, stages, "representation", start,
                                        {"validation": trainer.last_training_stats})
         os.replace(os.path.join(trainer.save_path, "resolved_config.json"),
@@ -174,7 +181,7 @@ def run_multi_stage_training(params, config=None):
         start = decoder.current_iter + 1
         details = fit_astc_decoder(trainer, steps=target.multi_stage_training_decoder_steps,
                                    lr_multiplier=target.multi_stage_training_decoder_lr_multiplier,
-                                   early_stop=target.early_stop)
+                                   early_stop=target.early_stop, final_report=False)
         fitted = _record_stage(trainer, stages, "decoder", start, details)
 
         print("[Multi Stage Training] layout_refit", flush=True)

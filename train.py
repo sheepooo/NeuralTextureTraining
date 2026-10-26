@@ -7,6 +7,7 @@ import argparse
 import json
 import copy
 import contextlib
+import io
 import math
 import time
 from typing import List, Optional, Tuple
@@ -33,8 +34,10 @@ from Comparison_ASTC import (
     comparison_reference,
     _render_model_mip0,
     comparison_material_size,
+    log_comparison_storage,
     _compute_group_metrics,
     run_astc_comparison_pipeline,
+    method_label, metric_records, write_metrics,
 )
 from Comparison_PBRScene import save_pbr_comparison
 from dataset import material_size
@@ -97,23 +100,30 @@ class PhaseTrainingControl:
 
 class Trainer(ASTCAwareTrainer):
 
-    def __init__(self, params: argparse.Namespace, config_override: Config = None) -> None:
+    def __init__(self, params: argparse.Namespace, config_override: Config = None,
+                 deployment_config: Config = None) -> None:
 
         # initialize required runtime fieldsvariables, e.g. dataset, configs and models
         if config_override is not None:
             configs = config_override
         else:
             configs = Config(params)
-        dataset = TextureDataset(configs)
-        print(f"[NormalEncoding] mode={dataset.normal_encoding}")
-        configs.num_mips = dataset.num_mips
-        # Tile size is measured in decoder/material texels, independent of GT resolution.
-        configs.pos_encoding_reference_edge = max(dataset.material_reconstruction_size)
-        model = TCNNModel(configs)
-        model.configure_direct_diffuse_from_dataset(dataset)
-        configs.material_reconstruction_size = list(material_size(model, dataset.texture_height, dataset.texture_width))
-        # Network output is fixed to 11 channels (aligned with diffuse->displacement); missing filled by dataset with 0
-        configs.num_channels = model.num_channels
+        startup_log = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(startup_log):
+                dataset = TextureDataset(configs)
+                print(f"[NormalEncoding] mode={dataset.normal_encoding}")
+                configs.num_mips = dataset.num_mips
+                # Tile size is measured in decoder/material texels, independent of GT resolution.
+                configs.pos_encoding_reference_edge = max(dataset.material_reconstruction_size)
+                model = TCNNModel(configs)
+                model.configure_direct_diffuse_from_dataset(dataset)
+                configs.material_reconstruction_size = list(material_size(model, dataset.texture_height, dataset.texture_width))
+                configs.num_channels = model.num_channels
+            log_comparison_storage(model, dataset, configs.astc_block, configs.ref_astc_resolution,
+                                   deployment_config=deployment_config)
+        finally:
+            print(startup_log.getvalue(), end='')
 
         # initialize required runtime fields
         self.device = configs.device
@@ -392,16 +402,17 @@ class Trainer(ASTCAwareTrainer):
 
 
     def _reset_training_phase(self, phase, start):
+        self._metrics_phase = phase
         self._phase_control = PhaseTrainingControl(
             phase, start,
             threshold=self.early_stop_psnr_threshold,
         )
         self._early_stop_phase_start_iter = start
 
-    def _validation_score(self, curr_iter, eval_psnr):
+    def _validation_score(self, curr_iter, eval_psnr, verbose=True):
         if not self.enable_astc_compare:
             return float(eval_psnr)
-        metrics = self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
+        metrics = self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path, verbose=verbose)
         average = metrics.get(f"fntc_astc_{self.astc_block}", {}).get("average")
         if average is None:
             raise ValueError("Compressed validation metrics are required for best-model selection")
@@ -421,10 +432,13 @@ class Trainer(ASTCAwareTrainer):
             os.replace(path + ".tmp", path)
         return stop
 
-    def _complete_training_phase(self):
+    def _complete_training_phase(self, eval_psnr=None, score=None, final_report=True):
         last_iter = self.model.current_iter
         # Include the final updated model even when its iteration is not a check point.
-        score = self._validation_score(last_iter, self.eval(last_iter))
+        if score is None:
+            if eval_psnr is None:
+                eval_psnr = self.eval(last_iter)
+            score = self._validation_score(last_iter, eval_psnr, verbose=final_report)
         self._observe_training_score(score, last_iter, allow_stop=False, adjust_lr=False)
         final_lr = self.model.optimizer.param_groups[0]["lr"]
         restored_earlier = self._phase_control.best_iteration != last_iter
@@ -434,15 +448,18 @@ class Trainer(ASTCAwareTrainer):
                                         completed_iteration=last_iter, final_decoder_lr=final_lr)
         # Refresh terminal media and metrics after best-state restoration.
         if restored_earlier:
-            self._validation_score(last_iter, self.eval(last_iter))
-        if self.enable_pbr_compare:
-            self.run_pbr_comparison(curr_iter=last_iter, output_root=self.media_path)
-        self.model.save(last_iter, self.model_path)
-        self.save_compressed_materials(self.media_path, last_iter)
-        self._log_checkpoint_interval(last_iter)
+            restored_psnr = self.eval(last_iter)
+            if final_report:
+                self._validation_score(last_iter, restored_psnr)
+        if final_report:
+            if self.enable_pbr_compare:
+                self.run_pbr_comparison(curr_iter=last_iter, output_root=self.media_path)
+            self.model.save(last_iter, self.model_path)
+            self.save_compressed_materials(self.media_path, last_iter)
+            self._log_checkpoint_interval(last_iter)
         self._log_total_training_time()
 
-    def train(self) -> None:
+    def train(self, final_report=True) -> None:
 
         loss_weights = torch.tensor(self.output_loss_weights, device=self.device, dtype=torch.float32)
         if self.model._decoder_adaptation_features is None:
@@ -450,6 +467,7 @@ class Trainer(ASTCAwareTrainer):
             phase = ("warmup" if self.configs.astc_codec_in_loop_enable and self.trained_iter < codec_start
                      else "codec" if self.configs.astc_codec_in_loop_enable else "feature")
             self._reset_training_phase(phase, self.trained_iter)
+        eval_psnr = current_psnr = None
         for curr_iter in range(self.trained_iter, self.max_iter):
 
             codec_due = self._begin_astc_step(curr_iter)
@@ -530,7 +548,7 @@ class Trainer(ASTCAwareTrainer):
 
             # track whether ASTC comparison was already run this iteration (avoid duplicate runs)
             _astc_already_ran = False
-            _pbr_already_ran = False
+            eval_psnr = current_psnr = None
 
             # eval
             if (curr_iter - self._early_stop_phase_start_iter) % self.eval_interval == 0:
@@ -538,7 +556,8 @@ class Trainer(ASTCAwareTrainer):
 
                 if (curr_iter > self._early_stop_phase_start_iter
                         and (curr_iter - self._early_stop_phase_start_iter) % self.early_stop_interval == 0):
-                    current_psnr = self._validation_score(curr_iter, eval_psnr)
+                    current_psnr = self._validation_score(
+                        curr_iter, eval_psnr, verbose=final_report)
                     _astc_already_ran = self.enable_astc_compare
                     self.writer.add_scalar('LR/decoder', self.model.optimizer.param_groups[0]["lr"], curr_iter)
                     stop = self._observe_training_score(
@@ -548,21 +567,21 @@ class Trainer(ASTCAwareTrainer):
                     print(f"[EarlyStopCheck] {self._phase_control.phase} iter {curr_iter}: "
                           f"PSNR={current_psnr:.4f}, stagnant_windows={self._phase_control.bad_windows}")
                     if stop:
-                        self._complete_training_phase()
+                        self._complete_training_phase(eval_psnr, current_psnr, final_report)
                         return
 
 
                 # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
 
-            if curr_iter > 0 and curr_iter % self.save_interval == 0:
+            if curr_iter > 0 and curr_iter + 1 < self.max_iter and curr_iter % self.save_interval == 0:
                 if self.enable_astc_compare and not _astc_already_ran:
                     self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path)
-                if self.enable_pbr_compare and not _pbr_already_ran:
+                if self.enable_pbr_compare:
                     self.run_pbr_comparison(curr_iter=curr_iter, output_root=self.media_path)
                 self.model.save(curr_iter, self.model_path)
                 self._log_checkpoint_interval(curr_iter)
 
-            if (self.enable_pbr_compare and curr_iter > 0
+            if (self.enable_pbr_compare and curr_iter > 0 and curr_iter + 1 < self.max_iter
                     and curr_iter % self.pbr_compare_interval == 0
                     and curr_iter % self.save_interval != 0):
                 self.run_pbr_comparison(curr_iter=curr_iter, output_root=self.media_path)
@@ -571,7 +590,7 @@ class Trainer(ASTCAwareTrainer):
                 torch.cuda.empty_cache()
                 tcnn.free_temporary_memory()
 
-        self._complete_training_phase()
+        self._complete_training_phase(eval_psnr, current_psnr, final_report)
 
     def fit_material_cnn(self, steps=50000, validation_interval=1000):
         """Fit material refinement at the deployed inference resolution."""
@@ -845,7 +864,6 @@ class Trainer(ASTCAwareTrainer):
             save_path = os.path.join(output_root, vc['display_name'], filename)
             TF.to_pil_image(tex_image).save(save_path)
 
-
     @contextlib.contextmanager
     def _compressed_material(self):
         """Use an isolated deployment model for material exports and their metrics."""
@@ -861,7 +879,6 @@ class Trainer(ASTCAwareTrainer):
         finally:
             self.model = source
 
-
     @torch.no_grad()
     def save_compressed_materials(self, output_root, iteration):
         self._ensure_visual_dirs(output_root)
@@ -872,7 +889,40 @@ class Trainer(ASTCAwareTrainer):
 
     @staticmethod
     def _mean_metric(values: List[float]) -> float:
-        return float(torch.tensor(values).mean().item()) if values else 0.0
+        return math.fsum(values) / len(values) if values else 0.0
+
+    def _metrics_context(self, iteration=None):
+        checkpoint = (getattr(self.model, 'loaded_checkpoint', None) if self.configs.mode == 'infer'
+                      else os.path.join(self.model_path, f'train_result_{iteration}', 'model.pth'))
+        selected = None
+        checkpoint = checkpoint if checkpoint and os.path.isfile(checkpoint) else None
+        checkpoint_iteration = (int(os.path.basename(os.path.dirname(checkpoint)).removeprefix('train_result_'))
+                                if checkpoint else None)
+        if self.configs.mode != 'infer' and self.last_training_stats.get('completed_iteration') == iteration:
+            selected = self.last_training_stats.get('best_iteration')
+        return dict(phase=getattr(self, '_metrics_phase', self.configs.mode),
+                    mode=self.configs.mode,
+                    checkpoint=checkpoint,
+                    checkpoint_iteration=checkpoint_iteration,
+                    selected_iteration=selected)
+
+    def _material_records(self, metrics, mip, height, width, storage):
+        method = (f'fntc_astc_{self.astc_block}' if (self.model._decoder_adaptation_features is not None
+                                                    or getattr(self.model, '_compressed_material', False))
+                  else 'fntc_quantized')
+        return metric_records(metrics, method_label(method), mip=mip, storage_bytes=storage[method],
+                              lpips_available=min(height, width) >= 128)
+
+    def _write_material_metrics(self, directory, records, storage, iteration=None):
+        size = comparison_material_size(self.model, self.texture_height, self.texture_width,
+                                        self.ref_astc_resolution)
+        return write_metrics(directory, records, evaluation='material', iteration=iteration,
+                             metadata=dict(self._metrics_context(iteration),
+                                           gt_size=[self.texture_height, self.texture_width],
+                                           inference_size=list(size), normal_encoding=self.normal_encoding,
+                                           channel_weights=self.eval_weights,
+                                           storage_bytes={method_label(name): value for name, value in storage.items()},
+                                           mip_aggregation='arithmetic_mean_of_mip_group_scores'))
 
     @torch.no_grad()
     def eval(self, curr_iter) -> float:
@@ -970,51 +1020,26 @@ class Trainer(ASTCAwareTrainer):
     @torch.no_grad()
     def infer(self) -> None:
         self._ensure_visual_dirs(self.infer_path)
-
-        psnr_list: List[float] = []
-        ssim_list: List[float] = []
-        lpips_list: List[float] = []
-        if self._metric_texture_name() == "normal":
-            metric_lines = ["Mip NormalAngularPSNR NormalAngularSSIM NormalAngularLPIPS\n"]
-        else:
-            metric_lines = ["Mip PSNR SSIM LPIPS\n"]
-        material_metric_lines = ["Mip Group PSNR SSIM LPIPS\n"]
-        material_group_order = ("diffuse", "normal", "romsd", "average")
-
+        records = []
+        storage = log_comparison_storage(self.model, self.dataset, self.astc_block,
+                                         self.ref_astc_resolution, verbose=False)
         with self._compressed_material():
             for mip in self._infer_mips():
                 pred, gt, mip_height, mip_width = self._render_mip_pair(mip)
                 material_metrics = self._compute_material_metrics(pred, gt)
-                psnr_value, ssim_value, lpips_value = material_metrics["average"]
-
-                psnr_list.append(psnr_value)
-                ssim_list.append(ssim_value)
-                if lpips_value is not None:
-                    lpips_list.append(lpips_value)
-                lpips_for_line = 0.0 if lpips_value is None else lpips_value
-
+                records.extend(self._material_records(material_metrics, mip, mip_height, mip_width, storage))
                 self._save_mip_visuals(pred, gt, self.infer_path, f"Mip_{mip}.png")
-                metric_lines.append(f"Mip_{mip} {psnr_value:.4f} {ssim_value:.4f} {lpips_for_line:.4f}\n")
-                for group_name in material_group_order:
-                    group_metric = material_metrics.get(group_name)
-                    if group_metric is None:
-                        continue
-                    material_metric_lines.append(
-                        f"Mip_{mip} {group_name} {group_metric[0]:.4f} "
-                        f"{group_metric[1]:.4f} {group_metric[2]:.4f}\n"
-                    )
-
-        psnr_avg = self._mean_metric(psnr_list)
-        ssim_avg = self._mean_metric(ssim_list)
-        lpips_avg = self._mean_metric(lpips_list)
-        metric_lines.append(f"AVER {psnr_avg} {ssim_avg} {lpips_avg}\n")
-        with open(os.path.join(self.infer_path, "metrics.txt"), "w+", encoding="utf-8") as file:
-            file.writelines(metric_lines)
-        material_metric_lines.append(
-            f"AVER average {psnr_avg:.4f} {ssim_avg:.4f} {lpips_avg:.4f}\n"
-        )
-        with open(os.path.join(self.infer_path, "metrics_material.txt"), "w+", encoding="utf-8") as file:
-            file.writelines(material_metric_lines)
+        averages = [row for row in records if row['group'] == 'average']
+        if len(averages) > 1:
+            values = tuple(self._mean_metric([row[key] for row in averages])
+                           if all(row[key] is not None for row in averages) else None
+                           for key in ('psnr', 'ssim', 'lpips'))
+            summary = metric_records({'average': values}, averages[0]['method'], mip=None,
+                                     storage_bytes=averages[0]['storage_bytes'],
+                                     lpips_available=values[2] is not None)[0]
+            summary['psnr_type'] = 'mean_across_mips'
+            records.append(summary)
+        self._write_material_metrics(self.infer_path, records, storage)
 
         if self.enable_astc_compare:
             self.run_astc_comparison(output_root=self.infer_path)
@@ -1022,7 +1047,8 @@ class Trainer(ASTCAwareTrainer):
             self.run_pbr_comparison(output_root=self.infer_path)
 
     @torch.no_grad()
-    def run_astc_comparison(self, curr_iter: int = None, output_root: str = None) -> dict:
+    def run_astc_comparison(self, curr_iter: int = None, output_root: str = None, verbose=True,
+                            report_context=None, save_outputs=True) -> dict:
         if output_root is None:
             output_root = self.infer_path if hasattr(self, "infer_path") else self.media_path
         return run_astc_comparison_pipeline(
@@ -1043,11 +1069,14 @@ class Trainer(ASTCAwareTrainer):
             ref_astc_resolution=self.ref_astc_resolution,
             eval_weights=self.eval_weights,
             inference_tile=self.eval_inference_tile,
+            verbose=verbose,
+            report_context={**self._metrics_context(curr_iter), **(report_context or {})},
+            save_outputs=save_outputs,
         )
 
     @torch.no_grad()
     def run_pbr_comparison(self, curr_iter: int = None, output_root: str = None,
-                           return_metrics: bool = False):
+                           return_metrics: bool = False, report_context=None, save_outputs=True):
         """Render the inferred and source Mip0 texture sets in one fixed PBR scene."""
         if output_root is None:
             output_root = self.infer_path if hasattr(self, "infer_path") else self.media_path
@@ -1058,12 +1087,9 @@ class Trainer(ASTCAwareTrainer):
                 self.model, self.texture_height, self.texture_width, self.ref_astc_resolution)
             reference = comparison_reference(self.dataset, self.astc_codec, ref_h, ref_w)
             gt = reference['gt']
-            quant_model = copy.deepcopy(self.model)
-            quant_model.simulate_quantize()
-            quant_model.eval()
-            fntc_astc_model = copy.deepcopy(quant_model)
+            fntc_astc_model = copy.deepcopy(self.model).eval()
+            fntc_astc_model.simulate_quantize()
             apply_astc_to_feature_grids(fntc_astc_model, self.astc_codec.roundtrip_rgba)
-            fntc_astc_model.eval()
             astc_base = None
             if self.super_resolution_enable:
                 astc_base = cached_astc_base(
@@ -1084,6 +1110,17 @@ class Trainer(ASTCAwareTrainer):
                 inference_size=(ref_h, ref_w),
             )
             traditional_astc = reference['astc']
+            storage = log_comparison_storage(self.model, self.dataset, self.astc_block,
+                                             self.ref_astc_resolution, verbose=False)
+            context = {
+                **self._metrics_context(curr_iter), **(report_context or {}),
+                'gt_size': [self.texture_height, self.texture_width], 'inference_size': [ref_h, ref_w],
+                'storage_bytes': {
+                    method_label('fntc', self.astc_block): storage[f'fntc_astc_{self.astc_block}'],
+                    method_label('astc', self.astc_block): storage[f'ref_astc_{self.astc_block}'],
+                    'GT': storage['gt'],
+                },
+            }
             path, metrics = save_pbr_comparison(
                 fntc_astc_texture=fntc_astc,
                 traditional_astc_texture=traditional_astc,
@@ -1101,20 +1138,14 @@ class Trainer(ASTCAwareTrainer):
                 detail_center=self.configs.pbr_detail_center,
                 detail_zoom=self.configs.pbr_detail_zoom,
                 reference_cache=reference['pbr'],
+                report_context=context,
+                save_outputs=save_outputs,
             )
             if curr_iter is not None:
                 for method, (psnr, ssim, lpips) in metrics.items():
                     self.writer.add_scalar(f"PBRCompare/{method}_PSNR", psnr, curr_iter)
                     self.writer.add_scalar(f"PBRCompare/{method}_SSIM", ssim, curr_iter)
                     self.writer.add_scalar(f"PBRCompare/{method}_LPIPS", lpips, curr_iter)
-            block_tag = self.astc_block.lower()
-            labels = (f"FNTC_{block_tag}", f"ASTC_{block_tag}")
-            label_width = max(map(len, labels))
-            for method, label in zip(("fntc", "astc"), labels):
-                psnr, ssim, lpips = metrics.get(method, (0.0, 0.0, 0.0))
-                suffix = f"  output={path}" if method == "astc" else ""
-                print(f"[PBR Test] Iter {curr_iter}: {label:<{label_width}} "
-                      f"PSNR={psnr:8.4f}  SSIM={ssim:7.4f}  LPIPS={lpips:7.4f}{suffix}")
             return (path, metrics) if return_metrics else path
         finally:
             self.model.train(was_training)
