@@ -17,7 +17,7 @@ def gradient_directions(count):
 def sample_feature_inputs(params, spec, uv, selected_level, gradient_count=0):
     """Return center followed by neighbor-minus-center differences.
 
-    All samples use the same parameter tensor, including decoded ASTC and frozen
+    All samples use bilinear repeat filtering of the same parameter tensor, including decoded ASTC and frozen
     adaptation tensors. Eight directions add the four diagonal neighbors to the
     axial directions, completing the selected mip's 3x3 texel neighborhood.
     Twenty-four directions use the complete 5x5 neighborhood in row-major order.
@@ -31,16 +31,6 @@ def sample_feature_inputs(params, spec, uv, selected_level, gradient_count=0):
     queries = uv[:, None, :] + shifts[None, :, :] / resolution[:, None, :]
     query_res = resolution[:, None, :].expand(-1, len(shifts), -1).reshape(-1, 1)
     corners, weights = bilinear_texel_corners(queries.reshape(-1, 2), query_res)
-    if not gradient_count and spec.interpolation == "Nearest":
-        corners = torch.remainder(torch.floor(torch.remainder(queries.reshape(-1, 2), 1.) * query_res),
-                                  query_res).long()[:, None, :]
-        weights = torch.ones_like(weights[:, :1])
-    elif not gradient_count and spec.interpolation == "Smoothstep":
-        fraction = torch.remainder(torch.remainder(queries.reshape(-1, 2), 1.) * query_res - .5, 1.)
-        tx, ty = (fraction.square() * (3 - 2 * fraction)).unbind(1)
-        weights = torch.stack(((1-tx)*(1-ty), tx*(1-ty), (1-tx)*ty, tx*ty), 1)
-    elif spec.interpolation not in ("Linear", "Nearest", "Smoothstep"):
-        raise ValueError(f"Unsupported feature interpolation: {spec.interpolation}")
     query_offsets = offsets[:, None].expand(-1, len(shifts)).reshape(-1, 1)
     indices = query_offsets + (corners[..., 1] * query_res + corners[..., 0]) * spec.n_features_per_level
     channels = torch.arange(spec.n_features_per_level, device=params.device)

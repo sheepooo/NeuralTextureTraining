@@ -39,22 +39,6 @@ def texel_aligned_grid_uv(uvs: torch.Tensor, selected_level, base_res: int) -> t
     return ((uvs * res - 0.5).clamp(min=0.0).minimum(res - 1.0) - 0.5) / scale
 
 
-def nearest_grid_uv(uvs: torch.Tensor, selected_level, base_res: int) -> torch.Tensor:
-    """Nearest texel center in tiny-cuda-nn grid coordinates."""
-    if not torch.is_tensor(selected_level):
-        selected_level = torch.full((uvs.shape[0], 1), float(selected_level), device=uvs.device, dtype=uvs.dtype)
-    level_int = torch.round(selected_level).to(torch.int64)
-    res = int(base_res) * torch.pow(
-        torch.full_like(selected_level, 2.0),
-        level_int.to(dtype=selected_level.dtype),
-    )
-    if bool(torch.all(res <= 1)):
-        return torch.zeros_like(uvs)
-    texel = torch.floor(uvs * res).clamp(min=0.0)
-    texel = torch.minimum(texel, torch.clamp(res - 1.0, min=0.0))
-    return (texel - 0.5) / torch.clamp(res - 1.0, min=1.0)
-
-
 def bilinear_repeat(image: torch.Tensor, uv_grid: torch.Tensor) -> torch.Tensor:
     """Texel-centered bilinear repeat lookup of an NCHW image at normalized UVs."""
     h, w = image.shape[-2:]

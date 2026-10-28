@@ -4,15 +4,14 @@ import copy
 import numpy as np
 import tinycudann as tcnn
 import torch.nn.functional as F
-from torch.func import functional_call
 from torchtyping import TensorType
 
 from configs import Config
 from Core.Positional_Encoding.positional_encoding import TiledPositionalEncoding
 from Core.Feature_Grid.feature_gradients import sample_feature_inputs
 from Core.Tile_CNN.material_cnn import MaterialCNN
+from Core.Feature_Grid.sampling import resize_bilinear_repeat
 from Core.Material_Encoding.normal_encoding import NORMAL_XY_MIN_Z
-from Core.Feature_Grid.sampling import nearest_grid_uv
 
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
@@ -143,8 +142,6 @@ class TCNNModel(torch.nn.Module):
             spec = FeatureGridSpec.from_config(grid_cfg, self.quantize_bits, self.save_bits, config.learning_rate)
             if self.mip0_only:
                 spec = FeatureGridSpec(**{**spec.__dict__, 'n_levels': 1, 'base_resolution': spec.max_resolution})
-            if self.direct_diffuse_enabled:
-                spec = FeatureGridSpec(**{**spec.__dict__, "interpolation": "Linear"})
             self.feature_grid_specs.append(spec)
             max_res = spec.max_resolution
             n_levels = spec.n_levels
@@ -406,7 +403,7 @@ class TCNNModel(torch.nn.Module):
         tex = self._decode_direct_diffuse_features(sampled).reshape(res, res, 3)
         tex = tex.permute(2, 0, 1)[None].contiguous()
         if (res, res) != (int(out_h), int(out_w)):
-            resize_fn = resize_fn or (lambda image, size: F.interpolate(image, size=size, mode="bilinear", align_corners=False))
+            resize_fn = resize_fn or resize_bilinear_repeat
             tex = resize_fn(tex, size=(int(out_h), int(out_w)))
         return tex.clamp(0, 1)
 
@@ -456,12 +453,9 @@ class TCNNModel(torch.nn.Module):
                 sampled_features = sampled_features.detach()
 
             if self.direct_diffuse_enabled and idx == 0:
-                nearest_uvs = nearest_grid_uv(uvs, selected_level_f, self.feature_grid_base_res[idx])
-                nearest_all = (functional_call(feature_grid, {"params": active_params}, (nearest_uvs,))
-                               if active_params is not None else feature_grid(nearest_uvs))
-                cols = selected_level_f * grid_fpl + torch.arange(grid_fpl, device=self.device)
-                nearest_features = torch.gather(nearest_all, 1, cols.to(torch.int64))
-                direct_diffuse = self._decode_direct_diffuse_features(nearest_features)
+                # The center occupies the first grid_fpl channels, followed by
+                # feature differences. Reuse its bilinear sample for direct RGB.
+                direct_diffuse = self._decode_direct_diffuse_features(sampled_features[:, :grid_fpl])
 
             features.append(sampled_features)
         features = torch.cat(features, dim=1)
@@ -616,6 +610,7 @@ class TCNNModel(torch.nn.Module):
 
             save_kwargs = {
                 'info': info,
+                'feature_sampling': np.array('bilinear_repeat_texel_center'),
                 'normal_encoding': np.array(self.normal_encoding),
                 'normal_output_convention': np.array('opengl'),
                 'normal_sampling': np.array('filter_encoded_then_decode'),
