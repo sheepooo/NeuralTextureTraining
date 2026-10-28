@@ -6,14 +6,18 @@ from torch.nn import functional as F
 
 
 class MaterialCNN(nn.Module):
-    version = 1
+    version = 2
+    mode = 'native_material_residual_leaky_relu_0.01_repeat_clamp'
 
-    def __init__(self, channels=10, hidden=16, rounds=2):
+    def __init__(self, channels=10, hidden=16, rounds=2, inference_size=None):
         super().__init__()
         if channels not in (10, 11) or hidden < 1 or rounds not in (1, 2):
             raise ValueError('MaterialCNN requires 10/11 canonical channels, positive hidden width and 1/2 rounds')
         self.channels, self.hidden, self.rounds = channels, hidden, rounds
         self.halo = rounds
+        if inference_size is not None and (len(inference_size) != 2 or any(n < 1 for n in inference_size)):
+            raise ValueError('Material CNN inference size must contain two positive dimensions')
+        self.register_buffer('inference_size', torch.tensor(inference_size or (0, 0), dtype=torch.int64))
         self.layers = nn.ModuleList([nn.ModuleList((nn.Conv2d(channels, hidden, 3),
                                                    nn.Conv2d(hidden, channels, 1))) for _ in range(rounds)])
         for _, last in self.layers:
@@ -26,29 +30,47 @@ class MaterialCNN(nn.Module):
         for spatial, pointwise in self.layers:
             residual = pointwise(F.leaky_relu(spatial(value), negative_slope=.01))
             value = value[..., 1:-1, 1:-1] + residual
-        return value.clamp(0, 1)
+        bounded = value.clamp(0, 1)
+        return bounded.detach() + (value - value.detach()) if self.training else bounded
+
+    def validate_size(self, size):
+        expected = tuple(self.inference_size.tolist())
+        if expected != (0, 0) and tuple(size) != expected:
+            raise ValueError(f'Material CNN was fitted at {expected}, received {tuple(size)}; '
+                             'use the original inference resolution or refit the CNN')
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        key = prefix + 'inference_size'
+        if key in state_dict:
+            self.validate_size(tuple(state_dict[key].tolist()))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    @staticmethod
+    def _patch(image, y, x, height, width, radius):
+        iy = torch.arange(y-radius, y+height+radius, device=image.device) % image.shape[-2]
+        ix = torch.arange(x-radius, x+width+radius, device=image.device) % image.shape[-1]
+        return image[..., iy[:, None], ix[None, :]]
 
     def forward(self, image):
-        return self.valid(F.pad(image, (self.halo,)*4, mode='circular'))
+        self.validate_size(image.shape[-2:])
+        return self.valid(self._patch(image, 0, 0, *image.shape[-2:], self.halo))
 
     def tiled(self, image, tile_size=128):
+        self.validate_size(image.shape[-2:])
         if tile_size < 1:
             return self(image)
         height, width = image.shape[-2:]
         result = torch.empty_like(image)
-        r = self.halo
         for y in range(0, height, tile_size):
             h = min(tile_size, height-y)
-            iy = torch.arange(y-r, y+h+r, device=image.device) % height
             for x in range(0, width, tile_size):
                 w = min(tile_size, width-x)
-                ix = torch.arange(x-r, x+w+r, device=image.device) % width
-                result[..., y:y+h, x:x+w] = self.valid(image.index_select(-2, iy).index_select(-1, ix))
+                result[..., y:y+h, x:x+w] = self.valid(self._patch(image, y, x, h, w, self.halo))
         return result
 
     def export_arrays(self):
         arrays = dict(material_cnn_version=np.array(self.version, dtype=np.int32),
-                      material_cnn_mode=np.array('native_material_residual_leaky_relu_0.01_repeat_clamp'),
+                      material_cnn_mode=np.array(self.mode),
                       material_cnn_shape=np.array([self.channels, self.hidden, self.rounds], dtype=np.int32))
         arrays.update({'material_cnn_'+k.replace('.', '_'):v.detach().cpu().numpy()
                        for k,v in self.state_dict().items()})
@@ -58,7 +80,7 @@ class MaterialCNN(nn.Module):
     def from_arrays(cls, arrays):
         model = cls(*map(int, arrays['material_cnn_shape']))
         if (int(arrays['material_cnn_version']) != cls.version
-                or str(arrays['material_cnn_mode']) != str(model.export_arrays()['material_cnn_mode'])):
+                or str(arrays['material_cnn_mode']) != cls.mode):
             raise ValueError('Unsupported material CNN export')
         model.load_state_dict({k:torch.from_numpy(np.array(arrays['material_cnn_'+k.replace('.', '_')], copy=True))
                                for k in model.state_dict()}, strict=True)

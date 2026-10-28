@@ -258,6 +258,9 @@ warmup 不早停，codec 启动后重置验证窗口。decoder 阶段平台期�
 1. **学习表示（`representation`）**：使用无隐藏层的仿射 decoder 训练 feature grid，关闭 PE 和 feature gradients。warmup 后优化合法 ASTC 端点与权重参数，学习用于材质重建的压缩表示。
 2. **拟合解码器（`decoder`）**：固定已学习的 ASTC 表示，重新初始化一层宽度为 32 的 decoder，启用四个轴向 feature 差分。使用解码后的 feature 和 SR base 训练 decoder，默认最多 50,000 步（`multi_stage_training_decoder_steps`，学习率倍率为 `multi_stage_training_decoder_lr_multiplier`）。
 3. **重拟合 latent 与选择块布局（`layout_refit`）**：固定最终 decoder，优化临时 latent，再重新编码并逐 ASTC 块选择合法布局。在第 0 步、每 100 步和末步验证，保留材质及已启用 PBR 的 PSNR/SSIM/LPIPS 均不退化的最佳码流。默认 1,000 步（`multi_stage_training_layout_refit_steps`，0 跳过），不增加推理开销。
+4. **材质 CNN（`material_cnn`）**：进一步改善重建材质，通过全图质量验收后才启用，否则保留不含 CNN 的模型。
+
+CNN 推理须沿用训练时的原生材质分辨率。CNN 阶段中断后，使用相同数据和配置，传入 `--mode train --load_dir <运行目录> --load_iter -1` 可继续训练。若最终未启用 CNN，推理时添加 `--no-material_cnn_enable`。
 
 布局精修要求单张 RGBA proxy grid、SR、feature gradients，且 GT/材质分辨率比例为整数；不支持的配置会跳过。`multi_stage_training.json` 记录各阶段指标、checkpoint 及 `final_metrics`。
 

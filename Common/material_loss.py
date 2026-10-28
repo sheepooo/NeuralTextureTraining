@@ -47,7 +47,8 @@ class MaterialLoss:
             gt_n = normal_vectors(gt_norm, self.normal_encoding)
             pr_n = normal_vectors(pr_norm, self.normal_encoding)
         else:
-            gt_n = gt.new_tensor((0., 0., 1.)).expand(gt.shape[0], 3)
+            gt_n = torch.zeros((gt.shape[0], 3), device=gt.device, dtype=gt.dtype)
+            gt_n[:, 2] = 1
             pr_n = gt_n
         # Use a fixed tangent-space light with positive Z so a flat normal map
         # receives direct light and all PBR channels get useful gradients.

@@ -468,6 +468,7 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
                         report_context=None,
                         detail_resolution: int = 2048,
                         save_outputs=True,
+                        include_detail_metrics=False,
                         ) -> Tuple[str, Dict[str, Tuple[float, float, float]]]:
     """Render FNTC-ASTC, traditional ASTC, and GT texture sets in one scene."""
     available = getattr(dataset, "available_textures", None)
@@ -522,15 +523,16 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
         "fntc": _render_metrics(fntc_astc, gt, fntc_astc_texture.device, ssim_metric, lpips_metric),
         "astc": fixed_metrics['full'],
     }
-    if not save_outputs:
+    if not save_outputs and not include_detail_metrics:
         return None, metrics
     out_dir = os.path.join(output_root, "Compare_PBRScene")
     if curr_iter is not None:
         out_dir = os.path.join(out_dir, f'iter_{curr_iter:08d}')
-    os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, 'comparison_strip.png')
-    _save_render_panels((fntc_astc, traditional_astc, gt), metrics, astc_block,
-                        out_dir, path, prefix='Scene_')
+    if save_outputs:
+        os.makedirs(out_dir, exist_ok=True)
+        _save_render_panels((fntc_astc, traditional_astc, gt), metrics, astc_block,
+                            out_dir, path, prefix='Scene_')
 
     # A fresh narrow viewport changes rasterization and UV derivatives/LOD.
     # These are new samples and shading evaluations, never resized full-frame crops.
@@ -549,6 +551,8 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
         'fntc': _render_metrics(detail[0], detail[2], fntc_astc_texture.device, ssim_metric, lpips_metric),
         'astc': fixed_metrics['detail'],
     }
+    if not save_outputs:
+        return None, dict(metrics, fntc_detail=detail_metrics['fntc'])
     _save_render_panels(detail, detail_metrics, astc_block, out_dir,
                         os.path.join(out_dir, 'comparison_strip_detail.png'), prefix='detail_')
     context = report_context or {}
@@ -572,25 +576,30 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
             suffix = f'  output={image_path}' if method == 'astc' else ''
             print(f'[PBR Test] {view} Iter {curr_iter}: {label:<{label_width}} '
                   f'PSNR={psnr:8.4f}  SSIM={ssim:7.4f}  LPIPS={lpips:7.4f}{suffix}')
-    return path, metrics
+    return path, dict(metrics, fntc_detail=detail_metrics['fntc']) if include_detail_metrics else metrics
 
 
 @torch.no_grad()
 def run_pbr_comparison_pipeline(model, dataset, codec, config, output_root, *, curr_iter=None,
                                 ssim_metric=None, lpips_metric=None, lighting=None,
-                                report_context=None, save_outputs=True):
+                                report_context=None, save_outputs=True, include_detail_metrics=False,
+                                material_override=None):
     """Reconstruct deployment materials and produce the scene comparison."""
     height, width = dataset.texture_height, dataset.texture_width
     ref_h, ref_w = comparison_material_size(model, height, width, config.ref_astc_resolution)
     reference = comparison_reference(dataset, codec, ref_h, ref_w)
-    decoded = make_deployment_model(model, codec)
-    base = (cached_astc_base(dataset, codec, config.super_resolution_base_resolution, (ref_h, ref_w))
-            if model.super_resolution_enable else None)
-    prediction = _render_model_mip0(
-        decoded, dataset, height, width, dataset.num_mips, config.device,
-        superres_base_override=base, inference_tile=config.eval_inference_tile,
-        inference_size=(ref_h, ref_w))
-    del decoded
+    prediction = material_override
+    if prediction is None:
+        decoded = make_deployment_model(model, codec)
+        base = (cached_astc_base(dataset, codec, config.super_resolution_base_resolution, (ref_h, ref_w))
+                if model.super_resolution_enable else None)
+        prediction = _render_model_mip0(
+            decoded, dataset, height, width, dataset.num_mips, config.device,
+            superres_base_override=base, inference_tile=config.eval_inference_tile,
+            inference_size=(ref_h, ref_w))
+        del decoded
+    elif prediction.shape != reference['gt'].shape:
+        raise ValueError('PBR material override must match the canonical GT raster')
     storage = log_comparison_storage(model, dataset, codec.astc_block, config.ref_astc_resolution, verbose=False)
     context = dict(report_context or {}, gt_size=[height, width], inference_size=[ref_h, ref_w],
                    storage_bytes={method_label('fntc', codec.astc_block): storage[f'fntc_astc_{codec.astc_block}'],
@@ -603,4 +612,5 @@ def run_pbr_comparison_pipeline(model, dataset, codec, config, output_root, *, c
         astc_block=codec.astc_block, ssim_metric=ssim_metric, lpips_metric=lpips_metric,
         mip_lod_bias=config.pbr_mip_lod_bias, lighting=lighting,
         detail_center=config.pbr_detail_center, detail_zoom=config.pbr_detail_zoom,
-        reference_cache=reference['pbr'], report_context=context, save_outputs=save_outputs)
+        reference_cache=reference['pbr'], report_context=context, save_outputs=save_outputs,
+        include_detail_metrics=include_detail_metrics)

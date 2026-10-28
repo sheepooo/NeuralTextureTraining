@@ -1,14 +1,12 @@
 import os
 import sys
 import torch
-import torch.nn.functional as F
 import datetime
 import argparse
 import copy
 import contextlib
 import io
 import math
-import time
 from typing import List, Tuple
 from torchmetrics.image import (
     LearnedPerceptualImagePatchSimilarity,
@@ -22,12 +20,11 @@ import tinycudann as tcnn
 
 from configs import get_args, inference_mips, mip_sampling_probabilities
 from model import TCNNModel
-from Core.Tile_CNN.material_cnn import MaterialCNN
 from dataset import TextureDataset
 from Common.material_loss import MaterialLoss
 from Common.material_reconstruction import (canonical_gt_mip, make_deployment_model, render_material_mip,
                                           postprocess_material, save_material_visuals,
-                                          comparison_material_size, _render_model_mip0)
+                                          comparison_material_size)
 from configs import Config, write_resolved_config
 from Common.comparison_astc import (
     ASTCENC_DEFAULT_PATH,
@@ -113,6 +110,12 @@ class Trainer(ASTCAwareTrainer):
                 configs.num_mips = dataset.num_mips
                 # Tile size is measured in decoder/material texels, independent of GT resolution.
                 configs.pos_encoding_reference_edge = max(dataset.material_reconstruction_size)
+                configs.material_cnn_inference_size = list(comparison_material_size(
+                    configs, dataset.texture_height, dataset.texture_width, configs.ref_astc_resolution))
+                if (deployment_config or configs).material_cnn_enable:
+                    from Core.Tile_CNN.training import validate_training_size
+                    validate_training_size((dataset.texture_height, dataset.texture_width),
+                                           configs.material_cnn_inference_size)
                 model = TCNNModel(configs)
                 model.configure_direct_diffuse_from_dataset(dataset)
                 configs.material_reconstruction_size = list(material_size(model, dataset.texture_height, dataset.texture_width))
@@ -460,107 +463,9 @@ class Trainer(ASTCAwareTrainer):
 
         self._complete_training_phase(eval_psnr, current_psnr, final_report)
 
-    def fit_material_cnn(self, steps=50000, validation_interval=1000):
-        """Fit material refinement at the deployed inference resolution."""
-        if steps < 1:
-            raise ValueError('Material CNN steps must be positive')
-        if validation_interval < 1:
-            raise ValueError('Material CNN validation interval must be positive')
-        model = self.model
-        if not self.mip0_only or model.feature_gradient_count != 4 or model.material_cnn is not None:
-            raise ValueError('Material CNN fitting requires an unfiltered four-gradient Mip0 decoder')
-        infer_h, infer_w = comparison_material_size(
-            model, self.texture_height, self.texture_width, self.ref_astc_resolution)
-        if self.texture_height % infer_h or self.texture_width % infer_w:
-            raise ValueError('Material CNN fitting requires an integer GT/inference size ratio')
-        sy, sx = self.texture_height // infer_h, self.texture_width // infer_w
-        started = time.perf_counter()
-        with torch.no_grad():
-            decoded = make_deployment_model(model, self.astc_codec)
-            base = (cached_astc_base(self.dataset, self.astc_codec,
-                                    self.configs.super_resolution_base_resolution,
-                                    output_size=(infer_h, infer_w))
-                    if self.super_resolution_enable else None)
-            raw = _render_model_mip0(decoded, self.dataset, infer_h, infer_w,
-                                     self.num_mips, self.device,
-                                     superres_base_override=base, inference_tile=128,
-                                     inference_size=(infer_h, infer_w))
-            del decoded
-        gt = self.dataset.expand_mip_to_canonical_level(
-            self.dataset.mip_cache[0]).permute(2, 0, 1)[None].float()
-        post = MaterialCNN(model.num_channels).to(self.device)
-        optimizer = torch.optim.Adam(post.parameters(), lr=.001)
-        weights = torch.tensor(self.output_loss_weights, device=self.device)
-        core, radius = 32, post.halo
-        # Extra ring covers the bilinear material upsampler.
-        axis = torch.arange(-radius-1, core+radius+1, device=self.device)
-        ty = torch.arange(core*sy, device=self.device)
-        tx = torch.arange(core*sx, device=self.device)
-        yy, xx = torch.meshgrid((ty+.5)/sy+1, (tx+.5)/sx+1, indexing='ij')
-        grid = torch.stack((2*xx/(core+2)-1, 2*yy/(core+2)-1), -1)
-
-        def positions(batch):
-            return torch.stack((torch.randint(infer_h, (batch,), device=self.device),
-                                torch.randint(infer_w, (batch,), device=self.device)), 1)
-
-        def loss_at(origins):
-            iy = (origins[:, 0, None]+axis) % infer_h
-            ix = (origins[:, 1, None]+axis) % infer_w
-            patches = raw[0, :, iy[:, :, None], ix[:, None, :]].permute(1, 0, 2, 3)
-            filtered = post.valid(patches)
-            prediction = F.grid_sample(filtered, grid[None].expand(len(origins), -1, -1, -1),
-                                       mode='bilinear', align_corners=False)
-            gy = (origins[:, 0, None]*sy+ty) % self.texture_height
-            gx = (origins[:, 1, None]*sx+tx) % self.texture_width
-            target = gt[0, :, gy[:, :, None], gx[:, None, :]].permute(1, 0, 2, 3)
-            prediction = prediction.permute(0, 2, 3, 1).reshape(-1, model.num_channels)
-            target = target.permute(0, 2, 3, 1).reshape(-1, model.num_channels)
-            loss = self._material_objective().reconstruction(
-                target, prediction, weights, statistics=False)[0]
-            if self.pbr_loss_enable and self.pbr_loss_weight > 0:
-                loss = loss+self.pbr_loss_weight*self._compute_pbr_render_loss(target, prediction)
-            return loss
-
-        validation = positions(16)
-        with torch.no_grad():
-            best = float(loss_at(validation))
-        if not math.isfinite(best):
-            raise RuntimeError('Nonfinite initial material CNN validation loss')
-        best_state, best_step = copy.deepcopy(post.state_dict()), 0
-        history = [dict(step=0, validation_loss=best)]
-        interval = min(validation_interval, steps)
-        for step in range(1, steps+1):
-            ratio = step/steps
-            lr = .001 if ratio <= .5 else (.0003 if ratio <= .8 else .0001)
-            optimizer.param_groups[0]['lr'] = lr
-            optimizer.zero_grad(set_to_none=True)
-            loss = loss_at(positions(4))
-            if not torch.isfinite(loss):
-                raise RuntimeError('Nonfinite material CNN training loss')
-            loss.backward()
-            optimizer.step()
-            self.writer.add_scalar('MaterialCNN/train_loss', float(loss.detach()), step)
-            if step % interval == 0 or step == steps:
-                with torch.no_grad():
-                    value = float(loss_at(validation))
-                if not math.isfinite(value):
-                    raise RuntimeError('Nonfinite material CNN validation loss')
-                if value < best:
-                    best, best_step = value, step
-                    best_state = copy.deepcopy(post.state_dict())
-                history.append(dict(step=step, validation_loss=value, best_step=best_step, lr=lr))
-                self.writer.add_scalar('MaterialCNN/validation_loss', value, step)
-                print(f'[Material CNN] {step}/{steps}: validation={value:.8f}, best={best_step}', flush=True)
-        post.load_state_dict(best_state)
-        if not all(torch.isfinite(p).all() for p in post.parameters()):
-            raise RuntimeError('Nonfinite material CNN parameters')
-        model.material_cnn = post.eval()
-        model.register_buffer('_material_cnn_version', torch.tensor(MaterialCNN.version, device=self.device))
-        return dict(steps=steps, best_step=best_step, best_validation_loss=best,
-                    inference_size=[infer_h, infer_w],
-                    gt_size=[self.texture_height, self.texture_width],
-                    parameters=sum(p.numel() for p in post.parameters()),
-                    seconds=time.perf_counter()-started, history=history)
+    def fit_material_cnn(self, steps=50000, validation_interval=1000, resume_state=None):
+        from Core.Tile_CNN.training import fit_material_cnn
+        return fit_material_cnn(self, steps, validation_interval, resume_state)
 
     def _cuda_trim_eval_mem(self, synchronize: bool = False) -> None:
         if self.device != "cuda":
@@ -770,12 +675,14 @@ class Trainer(ASTCAwareTrainer):
 
     @torch.no_grad()
     def run_pbr_comparison(self, curr_iter=None, output_root=None, return_metrics=False,
-                           report_context=None, save_outputs=True):
+                           report_context=None, save_outputs=True, include_detail_metrics=False,
+                           material_override=None):
         output_root = output_root or getattr(self, 'infer_path', self.media_path)
         path, metrics = run_pbr_comparison_pipeline(
             self.model, self.dataset, self.astc_codec, self.configs, output_root, curr_iter=curr_iter,
             ssim_metric=self.ssim, lpips_metric=self.lpips, lighting=self.pbr_lighting,
-            report_context={**self._metrics_context(curr_iter), **(report_context or {})}, save_outputs=save_outputs)
+            report_context={**self._metrics_context(curr_iter), **(report_context or {})}, save_outputs=save_outputs,
+            include_detail_metrics=include_detail_metrics, material_override=material_override)
         if curr_iter is not None:
             for method, values in metrics.items():
                 for name, value in zip(('PSNR', 'SSIM', 'LPIPS'), values):

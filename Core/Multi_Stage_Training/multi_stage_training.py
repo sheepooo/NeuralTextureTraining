@@ -102,7 +102,7 @@ def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
         model._qat_param_cache_iter = -1
 
 
-def _record_stage(trainer, stages, name, start_iteration, details):
+def _record_stage(trainer, stages, name, start_iteration, details, status='completed'):
     """Save one named stage using a common checkpoint and metric schema."""
     model = trainer.model
     iteration = int(model.current_iter)
@@ -112,7 +112,7 @@ def _record_stage(trainer, stages, name, start_iteration, details):
     pbr = (trainer.run_pbr_comparison(curr_iter=iteration, return_metrics=True)[1]
            if trainer.enable_pbr_compare else None)
     record = {
-        "name": name, "status": "completed",
+        "name": name, "status": status,
         "start_iteration": start_iteration, "end_iteration": iteration,
         "checkpoint": os.path.join(trainer.model_path, f"train_result_{iteration}", "model.pth"),
         "model": {"hidden_layers": model.n_hidden_layers, "neurons": model.n_neurons,
@@ -128,12 +128,71 @@ def _record_stage(trainer, stages, name, start_iteration, details):
         },
     }
     stages.append(record)
+    _write_stage_report(trainer, stages)
     return record
+
+
+def _write_stage_report(trainer, stages, completed=False):
+    latest = next((stage for stage in reversed(stages) if 'checkpoint' in stage), None)
+    report = dict(status='completed' if completed else 'running', stages=stages)
+    if latest is not None:
+        report.update(final_iteration=latest['end_iteration'], final_checkpoint=latest['checkpoint'],
+                      final_metrics=latest['metrics'])
+    path = os.path.join(trainer.save_path, 'multi_stage_training.json')
+    with open(path + '.tmp', 'w', encoding='utf-8') as output:
+        json.dump(report, output, indent=2)
+    os.replace(path + '.tmp', path)
+    return report
+
+
+def _finish_material_cnn(trainer, stages, steps, resume_state=None):
+    print('[Multi Stage Training] material_cnn', flush=True)
+    start = trainer.model.current_iter + 1
+    details = trainer.fit_material_cnn(steps, resume_state=resume_state)
+    progress_path = details.pop('progress_checkpoint')
+    trainer.model.current_iter += details['steps']
+    trainer.configs.material_cnn_enable = trainer.model.material_cnn is not None
+    trainer._write_resolved_config(trainer.configs)
+    _record_stage(trainer, stages, 'material_cnn', start, details,
+                  status='completed' if details['accepted'] else 'rejected')
+    trainer.save_compressed_materials(trainer.media_path, trainer.model.current_iter)
+    # Completion means all final artifacts exist. Keep recovery data on failure.
+    report = _write_stage_report(trainer, stages, completed=True)
+    os.remove(progress_path)
+    return report
+
+
+def _resume_material_cnn(params, target, path):
+    """Resume only the interrupted CNN stage from its frozen source and optimizer."""
+    state = torch.load(path, map_location='cpu', weights_only=True)
+    if state['version'] != 2:
+        raise ValueError('Unsupported material CNN training checkpoint version')
+    if not target.material_cnn_enable:
+        raise ValueError('Resuming the material CNN stage requires material_cnn_enable')
+    config = copy.deepcopy(target)
+    config.load_dir, config.load_iter = None, 0
+    config.material_cnn_enable = False
+    config.astc_aware_enable = config.astc_codec_in_loop_enable = False
+    config.astc_decoder_projection_interval = 0
+    trainer = Trainer(params, config_override=config, deployment_config=target)
+    try:
+        trainer.model.load_state_dict(state['source_model'])
+        trainer.model.current_iter = state['source_iteration']
+        with open(os.path.join(target.load_dir, 'multi_stage_training.json'), encoding='utf-8') as source:
+            stages = [stage for stage in json.load(source)['stages'] if stage['name'] != 'material_cnn']
+        _write_stage_report(trainer, stages)
+        return _finish_material_cnn(trainer, stages, target.material_cnn_steps, resume_state=state)
+    finally:
+        trainer.writer.close()
 
 
 def run_multi_stage_training(params, config=None):
     """Run representation, decoder and optional layout stages without numeric stage names."""
     target = config if config is not None else Config(params)
+    if target.load_dir:
+        progress = os.path.join(target.load_dir, 'models', 'material_cnn_training.pth')
+        if os.path.isfile(progress):
+            return _resume_material_cnn(params, target, progress)
     if not target.mip0_only or target.direct_diffuse_infer_mode != "disable":
         raise ValueError("Multi-stage ASTC training requires Mip0 and direct diffuse disabled")
     if target.n_hidden_layers < 0 or target.multi_stage_training_decoder_steps < 1:
@@ -192,21 +251,12 @@ def run_multi_stage_training(params, config=None):
             final = _record_stage(trainer, stages, "layout_refit", start, details)
         else:
             stages.append({"name": "layout_refit", "status": "skipped", "details": details})
+            _write_stage_report(trainer, stages)
             final = fitted
         if target.material_cnn_enable:
-            print('[Multi Stage Training] material_cnn', flush=True)
-            start = decoder.current_iter + 1
-            details = trainer.fit_material_cnn(target.material_cnn_steps)
-            decoder.current_iter += details['steps']
-            trainer.configs.material_cnn_enable = True
-            trainer._write_resolved_config(trainer.configs)
-            final = _record_stage(trainer, stages, 'material_cnn', start, details)
-        results = {"stages": stages, "final_iteration": final["end_iteration"],
-                   "final_checkpoint": final["checkpoint"], "final_metrics": final["metrics"]}
-        with open(os.path.join(trainer.save_path, "multi_stage_training.json"), "w", encoding="utf-8") as output:
-            json.dump(results, output, indent=2)
+            return _finish_material_cnn(trainer, stages, target.material_cnn_steps)
         trainer.save_compressed_materials(trainer.media_path, final['end_iteration'])
-        return results
+        return _write_stage_report(trainer, stages, completed=True)
     finally:
         trainer.writer.close()
 

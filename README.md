@@ -262,6 +262,9 @@ Multi-stage training is enabled by default (`multi_stage_training_enable`; entry
 1. **Learn the representation (`representation`)**: train the feature grid with an affine decoder, without PE or feature gradients. After warmup, optimize legal ASTC endpoint/weight parameters to learn a compressed representation for material reconstruction.
 2. **Fit the decoder (`decoder`)**: freeze the learned ASTC representation and initialize a new decoder with one hidden layer of width 32 and four axial feature differences. Train the decoder on the decoded features and SR base, with a budget of 50,000 steps (`multi_stage_training_decoder_steps`; LR multiplier: `multi_stage_training_decoder_lr_multiplier`).
 3. **Refit latents and select block layouts (`layout_refit`)**: freeze the final decoder and optimize a temporary latent field, then re-encode it and select legal layouts per ASTC block. Validate at step 0, every 100 steps and the final step, retaining the best bitstream whose material and enabled-PBR PSNR/SSIM/LPIPS do not regress. The default budget is 1,000 steps (`multi_stage_training_layout_refit_steps`; 0 skips refinement), with no added inference cost.
+4. **Material CNN (`material_cnn`)**: refine reconstructed materials and retain the CNN only when it passes full-image quality validation.
+
+CNN inference must use the native material resolution used for training. Resume an interrupted CNN stage with the same data/configuration and `--mode train --load_dir <run-directory> --load_iter -1`. If the final model excludes the CNN, add `--no-material_cnn_enable` for inference.
 
 Layout refinement requires one RGBA proxy grid, SR and feature gradients, with integer GT/material resolution ratios; unsupported configurations are skipped. `multi_stage_training.json` records each stage's metrics/checkpoint and `final_metrics`.
 

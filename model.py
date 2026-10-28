@@ -178,7 +178,8 @@ class TCNNModel(torch.nn.Module):
         if getattr(config, 'material_cnn_enable', False):
             if not self.mip0_only or self.feature_gradient_count != 4:
                 raise ValueError('Material CNN requires Mip0 four-gradient latent')
-            self.material_cnn = MaterialCNN(self.num_channels).to(self.device)
+            size = getattr(config, 'material_cnn_inference_size', None)
+            self.material_cnn = MaterialCNN(self.num_channels, inference_size=size).to(self.device)
             self.register_buffer('_material_cnn_version', torch.tensor(MaterialCNN.version, device=self.device))
         if self.direct_diffuse_enabled:
             if not self.feature_grid_n_features_per_level or self.feature_grid_n_features_per_level[0] < 3:
@@ -562,8 +563,17 @@ class TCNNModel(torch.nn.Module):
             raise ValueError('Checkpoint normal_encoding does not match model configuration')
         if ('_material_cnn_version' in state_dict) != (self.material_cnn is not None):
             raise ValueError('Checkpoint material CNN mode does not match model configuration')
-        if '_material_cnn_version' in state_dict and int(state_dict['_material_cnn_version']) != MaterialCNN.version:
-            raise ValueError('Unsupported material CNN checkpoint version')
+        if '_material_cnn_version' in state_dict:
+            version = int(state_dict['_material_cnn_version'])
+            if version == 1:
+                import warnings
+                warnings.warn('Legacy material CNN has no training resolution; using the explicitly '
+                              'selected inference size. Refit for a validated deployment contract.',
+                              UserWarning, stacklevel=2)
+                state_dict['_material_cnn_version'] = self._material_cnn_version.detach().clone()
+                state_dict['material_cnn.inference_size'] = self.material_cnn.inference_size.detach().clone()
+            elif version != MaterialCNN.version:
+                raise ValueError('Unsupported material CNN checkpoint version')
         for index, spec in enumerate(self.feature_grid_specs):
             key = f'feature_grids.{index}.params'
             if self.mip0_only and spec.n_levels == 1 and key in state_dict:
