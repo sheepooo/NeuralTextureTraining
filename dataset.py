@@ -17,6 +17,7 @@ from Core.Material_Encoding.normal_encoding import (
     normal_encoding_channels,
     normal_encoding_vis_mode,
     normalize_normal_rgb,
+    prepare_normal_input,
     normal_to_rgb,
 )
 
@@ -341,7 +342,7 @@ class TextureDataset(torch.nn.Module):
             if texture_type == "diffuse":
                 tensor = torch.pow(tensor, 2.2)
             elif texture_type == "normal":
-                tensor = encode_normal(tensor, self.normal_encoding)
+                tensor = prepare_normal_input(tensor, self.normal_encoding)
         return tensor
 
     def load_data(self) -> TensorType["texture_height", "texture_width", "num_channels"]:
@@ -441,6 +442,8 @@ class TextureDataset(torch.nn.Module):
         with open(path, 'w', encoding='utf-8') as output:
             json.dump({'texture_packing': self.texture_packing,
                        'canonical_channel_slices': self.canonical_channel_slices,
+                       'normal_encoding': self.normal_encoding,
+                       'normal_output_convention': 'opengl',
                        'padding_value': 1.0}, output, indent=2)
     
     def _resize_texture_for_mip(self, texture_type: str, tex_chw: torch.Tensor, mip_height: int, mip_width: int) -> torch.Tensor:

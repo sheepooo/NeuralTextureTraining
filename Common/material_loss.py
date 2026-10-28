@@ -37,13 +37,18 @@ class MaterialLoss:
                     torch.nan_to_num(pred[:, s:e].float(), nan=default, posinf=default, neginf=default).clamp(0, 1))
 
         gt_diff, pr_diff = get_pair("diffuse", 3, 0.5)
-        gt_norm, pr_norm = get_pair("normal", getattr(self.dataset, "normal_encoding", "xyz") == "xyz" and 3 or 2, 0.5)
         gt_rough, pr_rough = get_pair("roughness", 1, 0.5)
         gt_metal, pr_metal = get_pair("metallic", 1, 0.0)
         gt_spec, pr_spec = get_pair("specular", 1, 0.5)
 
-        gt_n = normal_vectors(gt_norm, self.normal_encoding)
-        pr_n = normal_vectors(pr_norm, self.normal_encoding)
+        if 'normal' in self.dataset.available_textures:
+            start, end = slices['normal']
+            gt_norm, pr_norm = get_pair('normal', end - start)
+            gt_n = normal_vectors(gt_norm, self.normal_encoding)
+            pr_n = normal_vectors(pr_norm, self.normal_encoding)
+        else:
+            gt_n = gt.new_tensor((0., 0., 1.)).expand(gt.shape[0], 3)
+            pr_n = gt_n
         # Use a fixed tangent-space light with positive Z so a flat normal map
         # receives direct light and all PBR channels get useful gradients.
         lighting = getattr(self, "_pbr_lighting", None)
@@ -75,53 +80,47 @@ class MaterialLoss:
         return torch.nan_to_num(torch.nn.functional.smooth_l1_loss(pred_shaded, gt_shaded),
                                 nan=0.0, posinf=1.0, neginf=0.0)
 
-    def reconstruction(
-        self,
-        gt_texture: torch.Tensor,
-        predict_texture: torch.Tensor,
-        loss_weights: torch.Tensor,
-    ):
-        total_loss = torch.tensor(0.0, device=gt_texture.device, dtype=torch.float32)
-        stats = {}
-
+    def _group_losses(self, gt_texture, predict_texture, loss_weights):
+        """Yield per-texel raw and weighted losses from one material definition."""
+        gt, pred = gt_texture.float(), predict_texture.float()
         for group, textures in self.dataset.texture_packing.items():
-            idx = self._group_indices(textures, gt_texture.device)
+            idx = self._group_indices(textures, gt.device)
             if idx.numel() == 0:
-                stats[group] = None
+                yield group, None, None, None
                 continue
-
-            pred = torch.index_select(predict_texture.float(), dim=1, index=idx)
-            gt = torch.index_select(gt_texture.float(), dim=1, index=idx)
+            p, g = pred.index_select(1, idx), gt.index_select(1, idx)
             weights = loss_weights.index_select(0, idx).float()
-            weight = weights.mean()
-
-            if group == "normal":
-                raw_loss = normal_angular_loss(pred, gt, self.normal_encoding)
-                weighted_loss = raw_loss * weights.sum()
+            if group == 'normal':
+                raw = normal_angular_loss(p, g, self.normal_encoding, reduction='none')
+                weighted = raw * weights.sum()
             else:
-                mse = (gt - pred).pow(2).mean(dim=0)
-                raw_loss = mse.mean()
-                weighted_loss = (mse * weights).sum()
+                errors = (p - g).square()
+                raw = errors.mean(1)
+                weighted = (errors * weights).sum(1)
+            yield group, raw, weighted, weights.mean()
 
-            total_loss = total_loss + weighted_loss
-            stats[group] = {
-                "loss": float(weighted_loss.detach().item()),
-                "raw_loss": float(raw_loss.detach().item()),
-                "weight": float(weight.detach().item()),
-            }
+    def per_sample(self, gt_texture, predict_texture, loss_weights):
+        """Material loss per texel for independent ASTC block acceptance."""
+        loss = gt_texture.new_zeros(len(gt_texture), dtype=torch.float32)
+        for _, _, weighted, _ in self._group_losses(gt_texture, predict_texture, loss_weights):
+            if weighted is not None:
+                loss = loss + weighted
+        return loss
 
-        return total_loss, stats
-
-    def residual(self, target, prediction, weights, statistics=False):
-        mse = (target.float() - prediction.float()).square().mean(dim=0)
-        loss = (mse * weights.float()).sum()
+    def reconstruction(self, gt_texture, predict_texture, loss_weights, statistics=True):
+        total = gt_texture.new_zeros((), dtype=torch.float32)
         stats = {}
-        if statistics:
-            groups = {}
-            for group, textures in self.dataset.texture_packing.items():
-                idx = self._group_indices(textures, target.device)
-                if idx.numel():
-                    groups[group] = (mse.index_select(0, idx) * weights.index_select(0, idx).float()).sum().detach()
-            values = torch.stack([loss.detach(), *groups.values()]).tolist()
-            stats = dict(loss=values[0], **{name: {'loss': value} for name, value in zip(groups, values[1:])})
-        return loss, stats
+        for group, raw, weighted, weight in self._group_losses(gt_texture, predict_texture, loss_weights):
+            if weighted is None:
+                if statistics:
+                    stats[group] = None
+                continue
+            value = weighted.mean()
+            total = total + value
+            if statistics:
+                stats[group] = {
+                    'loss': value.detach().item(),
+                    'raw_loss': raw.mean().detach().item(),
+                    'weight': weight.detach().item(),
+                }
+        return total, stats

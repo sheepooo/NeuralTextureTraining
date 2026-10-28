@@ -1,4 +1,8 @@
+import warnings
 import torch
+
+
+NORMAL_XY_MIN_Z = 0.01
 
 
 def _enc(normal_encoding: str) -> str:
@@ -54,14 +58,14 @@ def decode_normal(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.
         # Project out-of-disk predictions slightly inside the hemisphere so
         # sqrt() never receives a zero argument during training backprop.
         xy_sq = (xy ** 2).sum(dim=cd, keepdim=True)
-        max_radius_sq = 1.0 - 1e-4
+        max_radius_sq = 1.0 - NORMAL_XY_MIN_Z ** 2
         scale = torch.sqrt(torch.clamp(
             max_radius_sq / torch.clamp(xy_sq, min=1e-8), max=1.0
         ))
         xy = xy * scale
         x = xy.narrow(cd, 0, 1)
         y = xy.narrow(cd, 1, 1)
-        z = torch.sqrt(torch.clamp(1.0 - (xy ** 2).sum(dim=cd, keepdim=True), min=1e-4))
+        z = torch.sqrt(torch.clamp(1.0 - (xy ** 2).sum(dim=cd, keepdim=True), min=NORMAL_XY_MIN_Z ** 2))
         return normal_to_rgb(torch.cat([x, y, z], dim=cd))
     if enc == 'hemi_oct':
         x = xy.narrow(cd, 0, 1)
@@ -74,14 +78,39 @@ def decode_normal(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.
 
 
 def normal_vectors(encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:
-    return normalize_normal_rgb(decode_normal(encoded, normal_encoding))
+    return normalize_normal_rgb(decode_normal(encoded.float().clamp(0, 1), normal_encoding))
 
 
-def normal_angular_loss(pred_encoded: torch.Tensor, gt_encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:
-    pred_n = normal_vectors(pred_encoded, normal_encoding)
+def normal_angular_loss(pred_encoded: torch.Tensor, gt_encoded: torch.Tensor, normal_encoding: str = 'xyz',
+                        reduction: str = 'mean') -> torch.Tensor:
+    # Use the deployed UNORM range in forward, but allow out-of-range decoder
+    # channels to recover. A second hard clamp here would strand them forever.
+    pred = pred_encoded.float()
+    bounded = pred + (pred.clamp(0, 1) - pred).detach()
+    pred_n = normalize_normal_rgb(decode_normal(bounded, normal_encoding))
     gt_n = normal_vectors(gt_encoded, normal_encoding)
     dot = (pred_n * gt_n).sum(dim=_channel_dim(pred_n)).clamp(-1.0, 1.0)
-    return ((1.0 - dot) * 0.5).mean()
+    loss = (1.0 - dot) * 0.5
+    if reduction == 'none':
+        return loss
+    if reduction != 'mean':
+        raise ValueError('Normal angular loss reduction must be mean or none')
+    return loss.mean()
+
+
+def prepare_normal_input(rgb, normal_encoding='xyz'):
+    """Encode OpenGL source normals, reporting information lost by hemisphere encodings."""
+    rgb = rgb.float()
+    if not torch.isfinite(rgb).all():
+        raise ValueError('Normal input contains nonfinite values')
+    # Normalization cannot change Z's sign; avoid normalizing the full image twice.
+    negative = _take(rgb, 2, 1) < .5
+    if _enc(normal_encoding) in ('xy', 'hemi_oct') and bool(negative.any()):
+        count = int(negative.sum())
+        message = (f'{count} normal texels have negative Z, which {normal_encoding} cannot represent; '
+                   'use normal_encoding: xyz to preserve the source hemisphere')
+        warnings.warn(message, UserWarning, stacklevel=2)
+    return encode_normal(rgb, normal_encoding)
 
 
 def normal_angular_error_degrees(pred_encoded: torch.Tensor, gt_encoded: torch.Tensor, normal_encoding: str = 'xyz') -> torch.Tensor:

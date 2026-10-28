@@ -366,6 +366,8 @@ The model supports **heterogeneous feature grids** through the `feature_grid_con
 
 Independent loss weights can be assigned to each texture type via the `texture_loss_weights` field in `configs.py`, balancing the contribution of different channels during training (e.g., diffuse typically weighted higher than displacement).
 
+Normal inputs use the OpenGL convention. Convert DirectX normals by flipping green before input. XY and hemi-oct encode only the positive-Z hemisphere and automatically warn about negative-Z inputs; use `normal_encoding: xyz` to preserve negative Z.
+
 ### Configurable Network Architecture
 
 ```yaml

@@ -320,11 +320,8 @@ class ASTCAwareTrainer:
             self._sync_astc_source()
 
     def _compute_astc_reconstruction_loss(self, gt, prediction, base, loss_weights, curr_iter=None):
-        if base is None:
-            return self._compute_reconstruction_loss(gt, prediction, loss_weights, curr_iter)
-        if getattr(self, 'native_reconstruction', False):
-            return self._compute_superres_residual_loss(gt.float(), prediction.float() + base.float(), loss_weights, curr_iter)
-        return self._compute_superres_residual_loss(gt - base, prediction, loss_weights, curr_iter)
+        material = prediction.float() if base is None else prediction.float() + base.float()
+        return self._compute_reconstruction_loss(gt.float(), material, loss_weights, curr_iter)
 
     @torch.no_grad()
     def _sample_astc_codec_batch(self):

@@ -66,7 +66,8 @@ def _select(trainer, proposal):
             def losses():
                 model._qat_param_cache.clear()
                 residual = trainer._predict_material(inputs).float()
-                errors = ((residual - (target - base).float()).square() * weights).sum(1).reshape(len(rows), -1)
+                errors = trainer._material_objective().per_sample(
+                    target, residual + base.float(), weights).reshape(len(rows), -1)
                 value = errors[:, :centers].mean(1)
                 if subpixel:
                     value += trainer.subpixel_sampling_ratio * errors[:, centers:].mean(1)

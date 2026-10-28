@@ -245,7 +245,8 @@ class Trainer(ASTCAwareTrainer):
         return self._objective
 
     def _compute_reconstruction_loss(self, gt_texture, predict_texture, loss_weights, curr_iter=None):
-        loss, stats = self._material_objective().reconstruction(gt_texture, predict_texture, loss_weights)
+        loss, stats = self._material_objective().reconstruction(
+            gt_texture, predict_texture, loss_weights, statistics=curr_iter is not None)
         if curr_iter is not None:
             self._last_loss_stats = stats
             for group, values in stats.items():
@@ -256,16 +257,6 @@ class Trainer(ASTCAwareTrainer):
         return loss
 
     def _loss_stats_str(self) -> str:
-        residual_stat = self._last_loss_stats.get("superres_residual")
-        if residual_stat is not None:
-            terms = []
-            for group, label in (("diffuse", "diffuse"), ("normal", "normal"),
-                                 ("romsd", "ROMSD")):
-                stat = residual_stat.get(group)
-                if stat is not None:
-                    terms.append(f"{label} loss:{stat['loss']:.6f}")
-            decomposition = " + ".join(terms)
-            return f"Weighted super-resolution residual loss:{residual_stat['loss']:.6f} = {decomposition}"
         labels = {
             "diffuse": "Weighted diffuse loss",
             "normal": "Weighted normal angular loss",
@@ -277,17 +268,6 @@ class Trainer(ASTCAwareTrainer):
             value = "-" if stat is None else f"{stat['loss']:.6f}"
             parts.append(f"{labels[group]}:{value}")
         return ", ".join(parts)
-
-    def _compute_superres_residual_loss(self, target_residual, predicted_residual, loss_weights, curr_iter=None):
-        loss, stats = self._material_objective().residual(target_residual, predicted_residual, loss_weights,
-                                                        statistics=curr_iter is not None)
-        if curr_iter is not None:
-            self._last_loss_stats = {'superres_residual': stats}
-            self.writer.add_scalar('Loss/superres_residual', stats['loss'], curr_iter)
-            for group, values in stats.items():
-                if group != 'loss':
-                    self.writer.add_scalar(f'Loss/superres_residual_{group}', values['loss'], curr_iter)
-        return loss
 
     def _reset_training_phase(self, phase, start):
         self._metrics_phase = phase
@@ -535,7 +515,8 @@ class Trainer(ASTCAwareTrainer):
             target = gt[0, :, gy[:, :, None], gx[:, None, :]].permute(1, 0, 2, 3)
             prediction = prediction.permute(0, 2, 3, 1).reshape(-1, model.num_channels)
             target = target.permute(0, 2, 3, 1).reshape(-1, model.num_channels)
-            loss = ((prediction-target).square().mean(0)*weights).sum()
+            loss = self._material_objective().reconstruction(
+                target, prediction, weights, statistics=False)[0]
             if self.pbr_loss_enable and self.pbr_loss_weight > 0:
                 loss = loss+self.pbr_loss_weight*self._compute_pbr_render_loss(target, prediction)
             return loss

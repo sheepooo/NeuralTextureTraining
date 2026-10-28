@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
-from Core.Material_Encoding.normal_encoding import decode_normal
+from Core.Material_Encoding.normal_encoding import decode_normal, encode_normal, normal_vectors
 from Common.comparison_astc import (comparison_label_color, method_label, metric_records, write_metrics,
                              cached_astc_base, comparison_reference, log_comparison_storage)
 from Common.material_reconstruction import comparison_material_size, make_deployment_model, _render_model_mip0
@@ -150,28 +150,33 @@ def _sample_level(texture: np.ndarray, uv: np.ndarray) -> np.ndarray:
     return a * (1 - f[:, 1:2]) + b * f[:, 1:2]
 
 
-def _mip_pyramid(texture: np.ndarray):
+def _mip_pyramid(texture: np.ndarray, normal_encoding=None):
     levels = [texture]
     while max(levels[-1].shape[-2:]) > 1:
         src = levels[-1]
+        if normal_encoding is not None:
+            src = decode_normal(torch.from_numpy(np.ascontiguousarray(src)).float(), normal_encoding).numpy()
         h, w = src.shape[-2:]
         if h & 1:
             src = np.concatenate([src, src[:, -1:, :]], axis=1)
         if w & 1:
             src = np.concatenate([src, src[:, :, -1:]], axis=2)
-        levels.append(
-            0.25 * (src[:, 0::2, 0::2] + src[:, 1::2, 0::2]
-                    + src[:, 0::2, 1::2] + src[:, 1::2, 1::2])
-        )
+        filtered = 0.25 * (src[:, 0::2, 0::2] + src[:, 1::2, 0::2]
+                           + src[:, 0::2, 1::2] + src[:, 1::2, 1::2])
+        if normal_encoding is not None:
+            # Vector-prefilter each mip, then store the original encoding just
+            # like TextureDataset. Bilinear/trilinear lookups filter that encoding.
+            filtered = encode_normal(torch.from_numpy(filtered), normal_encoding).numpy()
+        levels.append(filtered)
     return levels
 
 
 def _sample(texture: np.ndarray, uv: np.ndarray, uv_dx=None, uv_dy=None,
-            mip_lod_bias: float = 0.0) -> np.ndarray:
+            mip_lod_bias: float = 0.0, normal_encoding=None) -> np.ndarray:
     """Bilinear magnification and trilinear mip-filtered minification."""
     if uv_dx is None or uv_dy is None:
         return _sample_level(texture, uv)
-    levels = _mip_pyramid(texture)
+    levels = _mip_pyramid(texture, normal_encoding)
     h, w = texture.shape[-2:]
     scale = np.asarray([w, h], np.float32)
     rho = np.maximum(np.linalg.norm(uv_dx * scale, axis=1), np.linalg.norm(uv_dy * scale, axis=1))
@@ -190,6 +195,11 @@ def _sample(texture: np.ndarray, uv: np.ndarray, uv_dx=None, uv_dy=None,
     return low_result * (1.0 - blend) + high_result * blend
 
 
+def _sample_normal(texture, uv, uv_dx=None, uv_dy=None, mip_lod_bias=0., normal_encoding='xyz'):
+    encoded = _sample(texture, uv, uv_dx, uv_dy, mip_lod_bias, normal_encoding)
+    return normal_vectors(torch.from_numpy(encoded), normal_encoding).numpy()
+
+
 def _material_maps(texture: torch.Tensor, slices: Dict[str, tuple], normal_encoding: str,
                    available_textures=None) -> Dict[str, np.ndarray]:
     tex = torch.nan_to_num(texture[0].detach().float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
@@ -199,9 +209,6 @@ def _material_maps(texture: torch.Tensor, slices: Dict[str, tuple], normal_encod
         if name not in active:
             continue
         maps[name] = tex[start:end].cpu().numpy()
-    if "normal" in maps:
-        start, end = slices["normal"]
-        maps["normal"] = decode_normal(tex[start:end][None], normal_encoding)[0].cpu().numpy()
     return maps
 
 
@@ -309,7 +316,7 @@ def render_pbr_scene(texture: torch.Tensor, slices: Dict[str, tuple], normal_enc
     ), 0, 1)
     n = normal[idx]
     if "normal" in maps:
-        nts = _sample(maps["normal"], uv, uv_dx, uv_dy, mip_lod_bias) * 2.0 - 1.0
+        nts = _sample_normal(maps["normal"], uv, uv_dx, uv_dy, mip_lod_bias, normal_encoding)
         n = _normalize(tangent[idx] * nts[:, 0:1] + bitangent[idx] * nts[:, 1:2] + n * nts[:, 2:3])
     v = _normalize(eye - pos)
     f0 = (0.02 + 0.14 * spec) * (1 - metal) + albedo * metal
