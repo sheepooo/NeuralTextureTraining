@@ -1,5 +1,11 @@
 # NeuralTexture 训练代码
 
+BC1 与混合格式：在每个 `feature_grid_configs` 中写 `format: BC1`、`astc6x6` 或 `astc4x4`。默认单个 BC1 grid 用两张纹理保存六个颜色分量和两个二值分量，支持配置多个不同格式的 grid。
+
+BCn 感知训练参数位于 `BCn aware configs`，日常只需 `bcn_aware_enable` 与 `bcn_learning_rate`。编码、部署解码、导出和统计共用 surface 计划；checkpoint 的兼容迁移集中在公共层。
+
+参阅 [BC1 训练与部署契约](docs/BC1_ARCHITECTURE_CN.md)、[逐 grid 配置](docs/PER_GRID_COMPRESSION.md) 和 [可运行混合示例](examples/mixed_grid_formats.yaml)。历史 A/B 结果见 [八特征与二值消融报告](docs/BC1_RGBA8_AB_20261029_CN.md)。测试只在本地保留，不进入 Git。
+
 该项目用于训练神经纹理（Neural Texture）模型，代码基于 [PyTorch](https://pytorch.org/get-started/locally/) 与 [tiny-cuda-nn](https://github.com/NVlabs/tiny-cuda-nn) 实现，支持量化感知训练与模型导出。当前 FNTC 入口依赖 tiny-cuda-nn 和 NVIDIA GPU；本仓库没有独立的 CPU 训练实现。
 
 ## 什么是神经纹理?
@@ -291,7 +297,6 @@ astc_codec_backend: astc_differentiable_proxy
 astc_codec_start_frac: 0.1
 astc_learning_rate: 0.001
 astc_codec_in_loop_interval: 100
-astc_codec_update_latent: false
 astc_decoder_projection_interval: 500
 ```
 

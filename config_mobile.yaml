@@ -22,12 +22,10 @@ subpixel_jitter: 0.5
 # ---------- feature grid configs ----------
 feature_grid_configs:
   - max_resolution: 1024
-    quantize_bits: 8
-    save_bits: 32
+    format: astc6x6  # astc6x6 | astc4x4 | BC1
     learning_rate: 0.0005
   - max_resolution: 1024
-    quantize_bits: 8
-    save_bits: 32
+    format: astc6x6
     learning_rate: 0.001
 
 # ---------- feature gradient configs ----------
@@ -45,6 +43,10 @@ super_resolution_base_resolution: 512
 n_frequencies: 0
 pos_encoding_tile_size: 6
 
+# ---------- BCn aware configs ----------
+bcn_aware_enable: true
+bcn_learning_rate: 0.01
+
 # ---------- astc aware configs ----------
 astc_aware_enable: true
 astc_codec_backend: astc_differentiable_proxy  # astcenc | astc_differentiable_proxy
@@ -54,7 +56,6 @@ astc_learning_rate: 0.001  # CUDA endpoint and weight updates
 astc_decoder_projection_interval: 0  # projection requires one grid and SR; disabled for this two-grid non-SR preset
 # astcenc only
 astc_codec_in_loop_interval: 100  # astcenc only; CUDA runs every iteration
-astc_codec_update_latent: false  # astcenc identity STE; CUDA learns codec parameters
 
 # ---------- trainer configs ----------
 # representation: feature grid + SR base + mip + bias

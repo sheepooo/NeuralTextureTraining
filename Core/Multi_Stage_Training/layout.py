@@ -102,7 +102,7 @@ def refit_layout(trainer, steps):
         raise ValueError('Layout refit steps must be nonnegative')
     if not steps:
         return {'applied': False, 'reason': 'disabled'}
-    if (trainer.astc_codec_backend != 'astc_differentiable_proxy' or not trainer.mip0_only
+    if (not trainer.configs.native_astc_only or getattr(model, 'latent_format', 'astc') != 'astc' or trainer.astc_codec_backend != 'astc_differentiable_proxy' or not trainer.mip0_only
             or not model.quantize or len(model.astc_proxy) != 1 or len(model.feature_grids) != 1
             or model.feature_grid_specs[0].n_features_per_level != 4
             or not model.feature_gradient_count or model._decoder_adaptation_features is not None
@@ -122,7 +122,8 @@ def refit_layout(trainer, steps):
     device = torch.device(model.device)
     devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == 'cuda' else []
     weights = torch.tensor(trainer.output_loss_weights, device=model.device)
-    method = 'fntc_astc_' + trainer.astc_block
+    from Core.Feature_Grid.compression import compressed_method, astc_codec_for
+    method = compressed_method(model)
     stats = {'applied': True, 'steps': steps, 'accepted': False, 'best_step': 0, 'checks': []}
     completed = False
     try:
@@ -162,7 +163,7 @@ def refit_layout(trainer, steps):
                 model._decoder_adaptation_features = None
                 model.train()
                 rgba = (feature_to_unorm(candidate[offset:offset + count].reshape(resolution, resolution, 4), spec) * 255).round().byte().cpu().numpy()
-                proposal = ASTCProxyGrid.from_astc(encode_seed(trainer.astc_codec, rgba), model.device)
+                proposal = ASTCProxyGrid.from_astc(encode_seed(astc_codec_for(model,0), rgba), model.device)
                 local_accepted = _select(trainer, proposal)
                 trainer._sync_astc_source()
                 iteration = model.current_iter + step

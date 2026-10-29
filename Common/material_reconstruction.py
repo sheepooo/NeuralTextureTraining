@@ -7,7 +7,7 @@ import torchvision.transforms.functional as TF
 from dataset import material_size, clean_base_image
 from Core.Feature_Grid.sampling import resize_bilinear_repeat, sample_image
 from Core.Material_Encoding.normal_encoding import decode_normal
-from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
+from Core.Feature_Grid.compression import apply_latent_compression
 
 
 def _ref_astc_hw_from_side(side: Optional[int], base_h: int, base_w: int) -> Tuple[int, int]:
@@ -91,10 +91,10 @@ def _render_model_mip0(model, dataset, texture_height: int, texture_width: int, 
 
 
 @torch.no_grad()
-def make_deployment_model(model, codec):
+def make_deployment_model(model):
     decoded = copy.deepcopy(model).eval()
     decoded.simulate_quantize()
-    apply_astc_to_feature_grids(decoded, codec.roundtrip_rgba)
+    apply_latent_compression(decoded)
     decoded._decoder_adaptation_features = None
     decoded._compressed_material = True
     return decoded

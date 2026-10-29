@@ -36,7 +36,8 @@ from Common.comparison_astc import (
 )
 from Common.comparison_pbr_scene import run_pbr_comparison_pipeline
 from dataset import material_size
-from Core.ASTC_Aware.trainer import ASTCAwareTrainer
+from Core.Feature_Grid.training import FeatureGridTraining
+from Core.Feature_Grid.compression import compressed_method
 
 
 class PhaseTrainingControl:
@@ -92,7 +93,7 @@ class PhaseTrainingControl:
                 "lr_reductions": self.lr_reductions}
 
 
-class Trainer(ASTCAwareTrainer):
+class Trainer(FeatureGridTraining):
 
     def __init__(self, params: argparse.Namespace, config_override: Config = None,
                  deployment_config: Config = None) -> None:
@@ -284,7 +285,7 @@ class Trainer(ASTCAwareTrainer):
         if not self.enable_astc_compare:
             return float(eval_psnr)
         metrics = self.run_astc_comparison(curr_iter=curr_iter, output_root=self.media_path, verbose=verbose)
-        average = metrics.get(f"fntc_astc_{self.astc_block}", {}).get("average")
+        average = metrics.get(compressed_method(self.model, self.astc_block), {}).get("average")
         if average is None:
             raise ValueError("Compressed validation metrics are required for best-model selection")
         score = float(average[0])
@@ -332,11 +333,16 @@ class Trainer(ASTCAwareTrainer):
 
     def train(self, final_report=True) -> None:
 
-        loss_weights = torch.tensor(self.output_loss_weights, device=self.device, dtype=torch.float32)
+        loss_weights = torch.tensor(
+            self.output_loss_weights, device=self.device, dtype=torch.float32
+        )
         if self.model._decoder_adaptation_features is None:
-            codec_start = int(self.max_iter * self.astc_codec_start_frac)
-            phase = ("warmup" if self.configs.astc_codec_in_loop_enable and self.trained_iter < codec_start
-                     else "codec" if self.configs.astc_codec_in_loop_enable else "feature")
+            codec_start = int(self.max_iter * self.configs.codec_start_frac)
+            phase = (
+                "warmup"
+                if self.configs.codec_training_enable and self.trained_iter < codec_start
+                else "codec" if self.configs.codec_training_enable else "feature"
+            )
             self._reset_training_phase(phase, self.trained_iter)
         eval_psnr = current_psnr = None
         for curr_iter in range(self.trained_iter, self.max_iter):
@@ -441,7 +447,6 @@ class Trainer(ASTCAwareTrainer):
                         self._complete_training_phase(eval_psnr, current_psnr, final_report)
                         return
 
-
                 # print(self.model.optimizer.param_groups[0]['lr'], self.model.optimizer.param_groups[1]['lr'])
 
             if curr_iter > 0 and curr_iter + 1 < self.max_iter and curr_iter % self.save_interval == 0:
@@ -524,7 +529,7 @@ class Trainer(ASTCAwareTrainer):
 
     @torch.no_grad()
     def save_compressed_materials(self, output_root, iteration):
-        decoded = make_deployment_model(self.model, self.astc_codec)
+        decoded = make_deployment_model(self.model)
         for mip in self._infer_mips():
             pred, gt, _, _ = self._render_mip_pair(mip, decoded)
             self._save_mip_visuals(pred, gt, output_root, f'{iteration}_{mip}.png')
@@ -617,12 +622,12 @@ class Trainer(ASTCAwareTrainer):
         records = []
         storage = log_comparison_storage(self.model, self.dataset, self.astc_block,
                                          self.ref_astc_resolution, verbose=False)
-        decoded = make_deployment_model(self.model, self.astc_codec)
+        decoded = make_deployment_model(self.model)
         for mip in self._infer_mips():
             pred, gt, mip_height, mip_width = self._render_mip_pair(mip, decoded)
             material_metrics = self._compute_material_metrics(pred, gt)
-            records.extend(metric_records(material_metrics, method_label(f'fntc_astc_{self.astc_block}'),
-                                          mip=mip, storage_bytes=storage[f'fntc_astc_{self.astc_block}'],
+            records.extend(metric_records(material_metrics, method_label(compressed_method(self.model, self.astc_block)),
+                                          mip=mip, storage_bytes=storage[compressed_method(self.model, self.astc_block)],
                                           lpips_available=min(mip_height, mip_width) >= 128))
             self._save_mip_visuals(pred, gt, self.infer_path, f"Mip_{mip}.png")
         del decoded

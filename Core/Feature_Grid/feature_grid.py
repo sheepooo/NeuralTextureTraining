@@ -31,11 +31,11 @@ class FeatureGridSpec:
 
     @classmethod
     def from_config(cls, cfg: Dict, default_quantize_bits: int, default_save_bits: int, default_lr: float) -> "FeatureGridSpec":
-        unknown = set(cfg) - {'max_resolution', 'n_levels', 'quantize_bits', 'save_bits',
-                              'learning_rate', 'interpolation'}
+        unknown = set(cfg) - {'max_resolution', 'n_levels', 'n_features_per_level', 'quantize_bits', 'save_bits',
+                              'learning_rate', 'interpolation', 'format', 'astc_block', 'bc1_mode'}
         if unknown:
             raise ValueError(f'Unknown feature_grid_configs keys: {sorted(unknown)}')
-        for name in ('max_resolution', 'n_levels', 'quantize_bits', 'save_bits'):
+        for name in ('max_resolution', 'n_levels', 'n_features_per_level', 'quantize_bits', 'save_bits'):
             if name in cfg and (not isinstance(cfg[name], int) or isinstance(cfg[name], bool)):
                 raise ValueError(f'feature_grid_configs.{name} must be an integer')
         lr = cfg.get('learning_rate', default_lr)
@@ -58,13 +58,16 @@ class FeatureGridSpec:
             raise ValueError("save_bits must be one of 8, 16, 32 and >= quantize_bits")
         if sbits % qbits != 0:
             raise ValueError("save_bits must be divisible by quantize_bits")
-        if sbits // qbits > 4:
-            raise ValueError("feature-grid export supports at most four channels per level")
+        # Feature capacity is explicit; save_bits remains a legacy default for
+        # older configs, not the storage bitrate of a block-compressed surface.
+        channels = int(cfg.get('n_features_per_level', sbits // qbits))
+        if channels not in (1, 2, 4, 8):
+            raise ValueError('n_features_per_level must be 1, 2, 4 or 8 (tiny-cuda-nn supported sizes)')
         base_res = max(1, int(max_res >> (n_levels - 1)))
         return cls(
             max_resolution=max_res,
             n_levels=n_levels,
-            n_features_per_level=sbits // qbits,
+            n_features_per_level=channels,
             quantize_bits=qbits,
             save_bits=sbits,
             learning_rate=float(cfg.get("learning_rate", default_lr)),

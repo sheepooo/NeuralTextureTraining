@@ -21,7 +21,7 @@ from .layout import refit_layout
 def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
                      early_stop: bool = False, final_report: bool = True):
     """Keep source latents intact while fitting their fixed ASTC-decoded inputs."""
-    from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
+    from Core.Feature_Grid.compression import apply_latent_compression
 
     if steps < 1 or not math.isfinite(lr_multiplier) or lr_multiplier <= 0:
         raise ValueError("steps and lr_multiplier must be positive")
@@ -35,10 +35,12 @@ def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
     if trainer.super_resolution_enable and trainer.astc_superres_base_mip0 is None:
         raise ValueError("A deployment ASTC base is required for super-resolution adaptation")
 
+    from Core.Feature_Grid.compression import freeze_proxies
+    freeze_proxies(model)
     source = [grid.params.detach().clone() for grid in model.feature_grids]
     decoded = copy.deepcopy(model)
     decoded.simulate_quantize()
-    apply_astc_to_feature_grids(decoded, trainer.astc_codec.roundtrip_rgba)
+    apply_latent_compression(decoded)
     fixed = [grid.params.detach().clone() for grid in decoded.feature_grids]
     del decoded
     fields = ("trained_iter", "max_iter", "eval_interval", "save_interval", "early_stop",
@@ -46,7 +48,7 @@ def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
               "enable_astc_compare", "enable_pbr_compare", "_phase_control")
     previous = {name: getattr(trainer, name) for name in fields}
     old_scheduler = model.scheduler
-    old_codec = trainer.configs.astc_codec_in_loop_enable
+    old_codec = trainer.configs.codec_training_enable
     old_base = trainer.dataset.superres_base_cache[0] if trainer.super_resolution_enable else None
     old_requires_grad = [grid.params.requires_grad for grid in model.feature_grids]
     old_lrs = [group["lr"] for group in model.optimizer.param_groups]
@@ -62,7 +64,7 @@ def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
                 trainer.astc_superres_base_mip0[..., slices[name][0]:slices[name][1]]
                 for name in trainer.dataset.available_textures
             ], dim=-1)
-        trainer.configs.astc_codec_in_loop_enable = False
+        trainer.configs.codec_training_enable = False
         model.optimizer.param_groups[0]["lr"] *= lr_multiplier
         # Validation-window LR reductions replace the per-batch scheduler.
         model.scheduler = None
@@ -89,7 +91,7 @@ def fit_astc_decoder(trainer, steps: int = 1000, lr_multiplier: float = 0.5,
         model._decoder_adaptation_features = None
         model.scheduler = old_scheduler
         model.train(was_training)
-        trainer.configs.astc_codec_in_loop_enable = old_codec
+        trainer.configs.codec_training_enable = old_codec
         if trainer.super_resolution_enable:
             trainer.dataset.superres_base_cache[0] = old_base
         for grid, requires_grad in zip(model.feature_grids, old_requires_grad):
@@ -172,7 +174,7 @@ def _resume_material_cnn(params, target, path):
     config = copy.deepcopy(target)
     config.load_dir, config.load_iter = None, 0
     config.material_cnn_enable = False
-    config.astc_aware_enable = config.astc_codec_in_loop_enable = False
+    config.astc_aware_enable = config.codec_training_enable = False
     config.astc_decoder_projection_interval = 0
     trainer = Trainer(params, config_override=config, deployment_config=target)
     try:
@@ -228,10 +230,11 @@ def run_multi_stage_training(params, config=None):
         decoder_config.material_cnn_enable = False
         decoder = TCNNModel(decoder_config)
         decoder.astc_proxy = copy.deepcopy(source.astc_proxy)
-        decoder.astc_proxy.requires_grad_(False)
+        from Core.Feature_Grid.compression import freeze_proxies
         with torch.no_grad():
             for old_grid, new_grid in zip(source.feature_grids, decoder.feature_grids):
                 new_grid.params.copy_(old_grid.params)
+        freeze_proxies(decoder)
         decoder.current_iter = representation["end_iteration"]
         trainer.model, trainer.configs = decoder, decoder_config
         trainer._write_resolved_config(decoder_config)

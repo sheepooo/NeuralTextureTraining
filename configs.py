@@ -13,13 +13,9 @@ from Core.Feature_Grid.feature_grid import FeatureGridSpec
 
 
 def _normalize_astc_block(value: str) -> tuple[str, tuple[int, int]]:
-    match = re.fullmatch(r"\s*(\d+)\s*[xX]\s*(\d+)\s*", str(value))
-    if match is None:
-        raise ValueError("astc_block must use the form WxH, such as 6x6")
-    width, height = int(match.group(1)), int(match.group(2))
-    if width <= 0 or height <= 0:
-        raise ValueError("astc_block dimensions must be positive")
-    return f"{width}x{height}", (width, height)
+    from Common.Block_Compression.astc import normalize_astc_block
+    block=normalize_astc_block(value)
+    return block,tuple(map(int,block.split('x')))
 
 
 def mip_sampling_probabilities(num_mips: int, mip0_only: bool, device: str = "cpu") -> torch.Tensor:
@@ -187,6 +183,14 @@ class Config():
         self.qat_noise_mult_start = float(getattr(params, "qat_noise_mult_start", 1.0))
         self.qat_noise_mult_end = float(getattr(params, "qat_noise_mult_end", 0.25))
         self.qat_noise_warmup_frac = float(getattr(params, "qat_noise_warmup_frac", 0.1))
+        # Legacy fallbacks only. New YAMLs select compression in each grid.format.
+        self.bcn_usage_weight = params.bcn_usage_weight
+        if not math.isfinite(self.bcn_usage_weight) or self.bcn_usage_weight < 0:
+            raise ValueError("bcn_usage_weight must be finite and nonnegative")
+        self.bcn_aware_enable = params.bcn_aware_enable
+        self.bcn_learning_rate = params.bcn_learning_rate
+        if not math.isfinite(self.bcn_learning_rate) or self.bcn_learning_rate <= 0:
+            raise ValueError("bcn_learning_rate must be finite and positive")
         ### ---------- ASTC aware configs ---------- ###
         backend = params.astc_codec_backend
         if backend not in ("astcenc", "astc_differentiable_proxy"):
@@ -206,15 +210,6 @@ class Config():
         self.astc_aware_enable = bool(params.astc_aware_enable)
         self.astc_codec_backend = backend
         self.astc_learning_rate = lr
-        self.astc_codec_start_frac = warmup
-        self.astc_codec_update_latent = (
-            bool(params.astc_codec_update_latent) if backend == "astcenc" else False
-        )
-        # Multi-stage decoder fitting temporarily disables codec updates.
-        self.astc_codec_in_loop_enable = self.astc_aware_enable and params.mode == "train"
-        self.astc_codec_in_loop_interval = 1 if backend == "astc_differentiable_proxy" else interval
-        self.astc_decoder_projection_interval = projection
-
         ### ---------- feature gradient configs ---------- ###
         self.feature_gradient_count = int(params.feature_gradient_count)
         if self.feature_gradient_count not in (0, 2, 4, 8, 24):
@@ -224,12 +219,12 @@ class Config():
         self.material_cnn_enable = params.material_cnn_enable
         if self.material_cnn_enable:
             if self.feature_gradient_count != 4 or not params.mip0_only:
-                raise ValueError('Material CNN requires Mip0 and feature_gradient_count: 4')
-            if params.mode == 'train' and not params.multi_stage_training_enable:
-                raise ValueError('Material CNN training requires multi_stage_training_enable: true')
+                raise ValueError("Material CNN requires Mip0 and feature_gradient_count: 4")
+            if params.mode == "train" and not params.multi_stage_training_enable:
+                raise ValueError("Material CNN training requires multi_stage_training_enable: true")
         self.material_cnn_steps = params.material_cnn_steps
         if self.material_cnn_steps < 1:
-            raise ValueError('material_cnn_steps must be positive')
+            raise ValueError("material_cnn_steps must be positive")
 
         ### ---------- trainer configs ---------- ###
         self.multi_stage_training_enable = bool(params.multi_stage_training_enable)
@@ -368,7 +363,7 @@ class Config():
         self.enable_astc_compare = bool(params.enable_astc_compare)
         self.astcenc_path = params.astcenc_path
         self.astcenc_quality = params.astcenc_quality
-        self.astc_block, self.astc_aware_block = _normalize_astc_block(params.astc_block)
+        self.astc_block, _ = _normalize_astc_block(params.astc_block)
         self.ref_astc_resolution = getattr(params, "ref_astc_resolution", None)
         if self.ref_astc_resolution is not None and self.ref_astc_resolution <= 0:
             raise ValueError('ref_astc_resolution must be positive')
@@ -407,43 +402,124 @@ class Config():
             raise ValueError("pbr_mip_lod_bias must be in [-8, 8]")
         if self.pbr_loss_weight < 0.0:
             raise ValueError("pbr_loss_weight must be non-negative")
-        if len(self.pbr_directional_light_direction) != 3 or len(self.pbr_directional_light_color) != 3:
+        if (
+            len(self.pbr_directional_light_direction) != 3
+            or len(self.pbr_directional_light_color) != 3
+        ):
             raise ValueError("PBR directional light direction and color must contain 3 values")
         if self.pbr_directional_light_intensity < 0.0:
             raise ValueError("pbr_directional_light_intensity must be non-negative")
         for index, light in enumerate(self.pbr_point_lights):
-            if isinstance(light, dict) and set(light) - {'position', 'intensity', 'color'}:
-                raise ValueError(f'Unknown pbr_point_lights[{index}] keys')
+            if isinstance(light, dict) and set(light) - {"position", "intensity", "color"}:
+                raise ValueError(f"Unknown pbr_point_lights[{index}] keys")
             if not isinstance(light, dict) or len(light.get("position", [])) != 3:
                 raise ValueError(f"pbr_point_lights[{index}] must contain a 3-value position")
             if len(light.get("color", [1.0, 1.0, 1.0])) != 3:
                 raise ValueError(f"pbr_point_lights[{index}] color must contain 3 values")
-            values = [*light['position'], *light.get('color', [1., 1., 1.]), light.get('intensity', 0.)]
-            if any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) for v in values):
-                raise ValueError(f'pbr_point_lights[{index}] must contain finite numbers')
+            values = [
+                *light["position"],
+                *light.get("color", [1.0, 1.0, 1.0]),
+                light.get("intensity", 0.0),
+            ]
+            if any(
+                not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v)
+                for v in values
+            ):
+                raise ValueError(f"pbr_point_lights[{index}] must contain finite numbers")
             if float(light.get("intensity", 0.0)) < 0.0:
                 raise ValueError(f"pbr_point_lights[{index}] intensity must be non-negative")
 
-        # Normalize configs to the internal format expected by the model
-        if self.feature_grid_configs is not None:
-            processed: List[Dict] = []
-            for cfg in self.feature_grid_configs:
-                spec = FeatureGridSpec.from_config(
-                    cfg, self.quantize_bits, self.save_bits, self.learning_rate
+        # Parse compact per-grid formats; expanded legacy recipes remain readable.
+        from Core.Feature_Grid.formats import GridCompression
+
+        raw_grids = self.feature_grid_configs
+        recipes = tuple(
+            GridCompression.from_config(g, params.latent_format, self.astc_block, params.bc1_mode)
+            for g in raw_grids
+        )
+        bc_count = sum(r.format == "bc1" for r in recipes)
+        processed = []
+        for cfg, recipe in zip(raw_grids, recipes):
+            cfg = dict(cfg)
+            if recipe.format == "bc1":
+                if not self.mip0_only or self.direct_diffuse_infer_mode != "disable":
+                    raise ValueError("BC1 grids require mip0_only and direct diffuse disabled")
+                if recipe.bc1_mode == "rgba_binary":
+                    cfg.setdefault("n_features_per_level", 8 if bc_count == 1 else 4)
+            spec = FeatureGridSpec.from_config(
+                cfg, self.quantize_bits, self.save_bits, self.learning_rate
+            )
+            if (
+                recipe.format == "bc1"
+                and recipe.bc1_mode == "rgba_binary"
+                and spec.n_features_per_level not in (4, 8)
+            ):
+                raise ValueError("BC1 RGBA needs four or eight features")
+            if (
+                recipe.format == "bc1"
+                and recipe.bc1_mode == "opaque_rgb"
+                and spec.n_features_per_level > 4
+            ):
+                raise ValueError("Legacy opaque BC1 supports at most four features")
+            if recipe.format == "astc" and spec.n_features_per_level > 4:
+                raise ValueError("ASTC grids currently support at most four features")
+            processed.append(
+                dict(
+                    max_resolution=spec.max_resolution,
+                    n_levels=1 if self.mip0_only else spec.n_levels,
+                    n_features_per_level=spec.n_features_per_level,
+                    quantize_bits=spec.quantize_bits,
+                    save_bits=spec.save_bits,
+                    learning_rate=spec.learning_rate,
+                    interpolation=spec.interpolation,
+                    **recipe.as_config(),
                 )
+            )
+        self.feature_grid_configs = processed
+        self.grid_compressions = recipes
+        families = {r.format for r in recipes}
+        self.codec_training_enable = self.mode == "train" and (
+            ("bc1" in families and self.bcn_aware_enable)
+            or ("astc" in families and self.astc_aware_enable)
+        )
+        heterogeneous = len(set(recipes)) > 1
+        self.codec_start_frac = (
+            float(params.astc_codec_start_frac) if self.native_astc_only else 0.0
+        )
+        self.codec_interval = 1
+        if families == {"astc"} and self.astc_codec_backend == "astcenc" and not heterogeneous:
+            self.codec_start_frac = float(params.astc_codec_start_frac)
+            self.codec_interval = int(params.astc_codec_in_loop_interval)
+        self.astc_decoder_projection_interval = (
+            int(params.astc_decoder_projection_interval) if self.native_astc_only else 0
+        )
+        if ("bc1" in families or heterogeneous) and (
+            not self.mip0_only or self.direct_diffuse_infer_mode != "disable"
+        ):
+            raise ValueError("BC1/mixed grids require mip0_only and direct diffuse disabled")
 
-                processed.append({
-                    "max_resolution": spec.max_resolution,
-                    "n_levels": 1 if self.mip0_only else spec.n_levels,
-                    "quantize_bits": spec.quantize_bits,
-                    "save_bits": spec.save_bits,
-                    "learning_rate": spec.learning_rate,
-                    "interpolation": spec.interpolation,
-                })
+    @property
+    def native_astc_only(self):
+        return (
+            self.astc_codec_backend == "astc_differentiable_proxy"
+            and all(
+                r.format == "astc" and r.astc_block == "6x6" and g["n_features_per_level"] == 4
+                for r, g in zip(self.grid_compressions, self.feature_grid_configs)
+            )
+            and self.direct_diffuse_infer_mode == "disable"
+        )
 
-            self.feature_grid_configs = processed
+    @property
+    def latent_format(self):
+        families = {r.format for r in self.grid_compressions}
+        return next(iter(families)) if len(families) == 1 else "mixed"
 
-    def make_group_config(self, group_name: str) -> 'Config':
+    @property
+    def bc1_mode(self):
+        modes = {r.bc1_mode for r in self.grid_compressions if r.format == "bc1"}
+        return next(iter(modes)) if len(modes) == 1 else None
+
+    def make_group_config(self, group_name: str) -> "Config":
         """Create a shallow copy of this Config with data_dir and save_dir
         overridden for a specific texture group (used in GroupsBatching mode).
 
@@ -454,6 +530,7 @@ class Config():
             A new Config object pointing to the specific group's data and save paths.
         """
         import copy
+
         cfg = copy.copy(self)
         cfg.data_dir = os.path.join(self.groups_batch_dir, group_name)
         cfg.save_dir = os.path.join(self.groups_save_dir, group_name)
@@ -462,6 +539,7 @@ class Config():
         cfg.num_mips = 1
         cfg.output_loss_weights = None
         return cfg
+
 
 def get_args():
     parser = argparse.ArgumentParser()
@@ -499,6 +577,14 @@ def get_args():
     parser.add_argument('--quantize_bits', type=int, default=8,
                         help='choose the bits to quantize',
                         choices=[2, 4, 8])
+    parser.add_argument('--latent_format', choices=['astc', 'bc1'], default='astc', help=argparse.SUPPRESS)
+    parser.add_argument('--bc1_mode', choices=['rgba_binary', 'opaque_rgb'], default='rgba_binary',
+                        help=argparse.SUPPRESS)
+    parser.add_argument('--bcn_usage_weight', '--bc1_usage_weight', dest='bcn_usage_weight', type=float, default=0.01,
+                        help='Weak binary usage/confidence prior; 0 disables it')
+    parser.add_argument('--bcn_aware_enable', '--bc1_aware_enable', dest='bcn_aware_enable', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--bcn_learning_rate', '--bc1_learning_rate', dest='bcn_learning_rate', type=float, default=0.01,
+                        help='Adam learning rate in RGB565/selector code units')
     parser.add_argument('--save_bits', type=int, default=32,
                         help='choose the bits to quantize',
                         choices=[8, 16, 32])
@@ -539,7 +625,7 @@ def get_args():
     group.add_argument("--astc_codec_in_loop_interval", type=int, default=100,
                         help="CPU codec interval; proxy runs every step")
     group.add_argument("--astc_codec_update_latent", action=argparse.BooleanOptionalAction, default=False,
-                        help="CPU latent identity STE")
+                        help=argparse.SUPPRESS)
     group.add_argument("--astc_decoder_projection_interval", type=int, default=500,
                         help="proxy material projection interval; 0 disables it")
 
@@ -681,6 +767,14 @@ def get_args():
         parser.error(str(exc))
 
     if yaml_defaults:
+        for old,new in (('bc1_aware_enable','bcn_aware_enable'),
+                        ('bc1_learning_rate','bcn_learning_rate'),
+                        ('bc1_usage_weight','bcn_usage_weight')):
+            if old in yaml_defaults:
+                value=yaml_defaults.pop(old)
+                if new in yaml_defaults and yaml_defaults[new]!=value:
+                    parser.error(f'Conflicting legacy {old} and {new}')
+                yaml_defaults.setdefault(new,value)
         _validate_yaml_defaults(parser, yaml_defaults)
         parser.set_defaults(**yaml_defaults)
 
@@ -692,7 +786,7 @@ def write_resolved_config(configs, directory) -> None:
     """Persist scalar/list/dict config values so log analyzers can recover run settings."""
     out = {}
     for key, value in vars(configs).items():
-        if key.startswith("_"):
+        if key.startswith("_") or key == "grid_compressions":
             continue
         if isinstance(value, (str, int, float, bool)) or value is None:
             out[key] = value

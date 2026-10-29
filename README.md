@@ -297,7 +297,6 @@ astc_codec_backend: astc_differentiable_proxy
 astc_codec_start_frac: 0.1
 astc_learning_rate: 0.001
 astc_codec_in_loop_interval: 100
-astc_codec_update_latent: false
 astc_decoder_projection_interval: 500
 ```
 
@@ -398,3 +397,16 @@ alongside the feature-grid samples. At equal material/GT resolution the residual
 and ASTC comparison reconstruct `clamp(bilinear_base + predicted_residual, 0, 1)` at native material centers before the shared final upsampling. The same mip-level
 offset is used for lower Mips. Enabling this mode automatically disables direct-diffuse inference,
 whose direct-output semantics conflict with residual prediction.
+
+
+### BC1 latent textures
+
+Set `format: BC1` on a grid in `feature_grid_configs` to use two BC1 surfaces carrying eight features: `[RGB, binary A] ? 2`. BC1-aware training jointly learns RGB565 endpoints, shared categorical selectors and block modes. Transparent texels have RGB=0 as required by BC1. Alpha is binary before bilinear filtering.
+
+BC1 automatically selects the RGB + binary-alpha layout, with a built-in weak usage prior and exact compressed inputs from step zero. The `BCn aware configs` section exposes `bcn_aware_enable` and `bcn_learning_rate`. Historical opaque configurations remain readable. The ASTC SR base/reference remain unchanged; Mip0, decoder adaptation and optional material CNN are supported.
+
+See the [architecture and training contract](docs/BC1_ARCHITECTURE_CN.md). Verify with `python tests/test_bc1_alpha.py`; reproduce comparisons with `python scripts/ab_latent_formats.py`. The [historical report](docs/BC1_AB_20261029_CN.md) describes the previous RGB-only four-feature layout.
+
+[Eight-feature A/B and binary-channel ablations](docs/BC1_RGBA8_AB_20261029_CN.md)
+
+Each feature grid can independently select an ASTC footprint or BC1, including mixed models. See [per-grid configuration and module ownership](docs/PER_GRID_COMPRESSION.md) and the [runnable example](examples/mixed_grid_formats.yaml).

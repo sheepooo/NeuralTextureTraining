@@ -12,6 +12,7 @@ from typing import Dict, Iterable, Tuple
 
 import numpy as np
 import torch
+from Core.Feature_Grid.compression import compressed_method
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 
@@ -445,9 +446,9 @@ def _annotated_render(image, name, metric=None):
     return Image.alpha_composite(panel, overlay).convert('RGB')
 
 
-def _save_render_panels(images, metrics, block, directory, comparison_path, prefix=''):
+def _save_render_panels(images, metrics, block, directory, comparison_path, prefix='', fntc_label=None):
     os.makedirs(directory, exist_ok=True)
-    names = (f'FNTC_{block}', f'ASTC_{block}', 'GT')
+    names = (fntc_label or f'FNTC_{block}', f'ASTC_{block}', 'GT')
     panels = [_annotated_render(image, name, metric) for image, name, metric in
               zip(images, names, (metrics['fntc'], metrics['astc'], None))]
     canvas = Image.new('RGB', (panels[0].width * 3, panels[0].height))
@@ -471,6 +472,7 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
                         include_detail_metrics=False,
                         ) -> Tuple[str, Dict[str, Tuple[float, float, float]]]:
     """Render FNTC-ASTC, traditional ASTC, and GT texture sets in one scene."""
+    fntc_label = (report_context or {}).get('fntc_label', f'FNTC_{astc_block}')
     available = getattr(dataset, "available_textures", None)
     if detail_resolution < 64:
         raise ValueError('PBR detail resolution must be at least 64')
@@ -532,7 +534,7 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
     if save_outputs:
         os.makedirs(out_dir, exist_ok=True)
         _save_render_panels((fntc_astc, traditional_astc, gt), metrics, astc_block,
-                            out_dir, path, prefix='Scene_')
+                            out_dir, path, prefix='Scene_', fntc_label=fntc_label)
 
     # A fresh narrow viewport changes rasterization and UV derivatives/LOD.
     # These are new samples and shading evaluations, never resized full-frame crops.
@@ -554,19 +556,19 @@ def save_pbr_comparison(fntc_astc_texture: torch.Tensor, traditional_astc_textur
     if not save_outputs:
         return None, dict(metrics, fntc_detail=detail_metrics['fntc'])
     _save_render_panels(detail, detail_metrics, astc_block, out_dir,
-                        os.path.join(out_dir, 'comparison_strip_detail.png'), prefix='detail_')
+                        os.path.join(out_dir, 'comparison_strip_detail.png'), prefix='detail_', fntc_label=fntc_label)
     context = report_context or {}
     records = [row for view, scores in (('Scene', metrics), ('Scene Detail', detail_metrics))
                for method, values in scores.items()
-               for row in metric_records({'image': values}, method_label(method, astc_block), view=view,
-                                         storage_bytes=context.get('storage_bytes', {}).get(method_label(method, astc_block)))]
+               for row in metric_records({'image': values}, (fntc_label if method == 'fntc' else method_label(method, astc_block)), view=view,
+                                         storage_bytes=context.get('storage_bytes', {}).get((fntc_label if method == 'fntc' else method_label(method, astc_block))))]
     write_metrics(out_dir, records, evaluation='pbr', iteration=curr_iter,
                   metadata=dict(context, astc_block=astc_block, normal_encoding=dataset.normal_encoding,
                                 render_sizes={'Scene': list(gt.shape[:2]), 'Scene Detail': list(detail[2].shape[:2])},
                                 mip_lod_bias=mip_lod_bias, lighting=lighting,
                                 detail_view={'center': list(detail_center), 'zoom': detail_zoom,
                                              'resolution': int(detail_resolution), 'rendered_separately': True}))
-    labels = (f'FNTC_{astc_block.lower()}', f'ASTC_{astc_block.lower()}')
+    labels = (fntc_label, f'ASTC_{astc_block.lower()}')
     label_width = max(map(len, labels))
     for view, scores, image_path in (
             ('Scene', metrics, path),
@@ -590,7 +592,7 @@ def run_pbr_comparison_pipeline(model, dataset, codec, config, output_root, *, c
     reference = comparison_reference(dataset, codec, ref_h, ref_w)
     prediction = material_override
     if prediction is None:
-        decoded = make_deployment_model(model, codec)
+        decoded = make_deployment_model(model)
         base = (cached_astc_base(dataset, codec, config.super_resolution_base_resolution, (ref_h, ref_w))
                 if model.super_resolution_enable else None)
         prediction = _render_model_mip0(
@@ -601,8 +603,9 @@ def run_pbr_comparison_pipeline(model, dataset, codec, config, output_root, *, c
     elif prediction.shape != reference['gt'].shape:
         raise ValueError('PBR material override must match the canonical GT raster')
     storage = log_comparison_storage(model, dataset, codec.astc_block, config.ref_astc_resolution, verbose=False)
-    context = dict(report_context or {}, gt_size=[height, width], inference_size=[ref_h, ref_w],
-                   storage_bytes={method_label('fntc', codec.astc_block): storage[f'fntc_astc_{codec.astc_block}'],
+    fntc_label = method_label(compressed_method(model,codec.astc_block))
+    context = dict(report_context or {}, fntc_label=fntc_label, gt_size=[height, width], inference_size=[ref_h, ref_w],
+                   storage_bytes={fntc_label: storage[compressed_method(model, codec.astc_block)],
                                   method_label('astc', codec.astc_block): storage[f'ref_astc_{codec.astc_block}'],
                                   'GT': storage['gt']})
     return save_pbr_comparison(

@@ -107,7 +107,7 @@ def fit_material_cnn(trainer, steps=50000, validation_interval=1000, resume_stat
     sy, sx = (gt // native for gt, native in zip(gt_size, size))
     started = time.perf_counter()
     with torch.no_grad():
-        decoded = make_deployment_model(model, trainer.astc_codec)
+        decoded = make_deployment_model(model)
         base = (cached_astc_base(trainer.dataset, trainer.astc_codec,
                                 trainer.configs.super_resolution_base_resolution, output_size=size)
                 if trainer.super_resolution_enable else None)

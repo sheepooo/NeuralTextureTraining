@@ -11,13 +11,6 @@ import csv
 import math
 import json
 import os
-import platform
-import shutil
-import subprocess
-import tempfile
-import urllib.request
-import zipfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional, Tuple
 
@@ -26,8 +19,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
 import torchvision.transforms.functional as TF
-from Core.ASTC_Aware.differentiable_proxy import apply_astc_to_feature_grids
+from Core.Feature_Grid.compression import apply_latent_compression
 from Core.Feature_Grid.sampling import resize_bilinear_repeat
+from Core.Feature_Grid.compression import compressed_method, latent_payload_bytes, grid_recipes
 from Core.Material_Encoding.normal_encoding import decode_normal, normal_angular_psnr
 from dataset import prefiltered_material
 from Common.material_reconstruction import (comparison_material_size, _render_gt_mip0, _render_model_mip0, _ref_astc_hw_from_side)
@@ -37,19 +31,11 @@ from Common.material_reconstruction import (comparison_material_size, _render_gt
 # Version / defaults
 # ---------------------------------------------------------------------------
 
-ASTCENC_DEFAULT_VERSION = "5.3.0"
-ASTCENC_DEFAULT_PATH = "tools/astcenc"
-
-
-def normalize_astc_block(block: str) -> str:
-    block_str = str(block).strip().lower()
-    if "x" not in block_str:
-        raise ValueError(f"Invalid ASTC block format '{block}'. Expected like '6x6'.")
-    w_str, h_str = block_str.split("x", 1)
-    w, h = int(w_str), int(h_str)
-    if w <= 0 or h <= 0:
-        raise ValueError(f"Invalid ASTC block '{block}'. Block dimensions must be positive.")
-    return f"{w}x{h}"
+from Common.Block_Compression.astc import (
+    ASTCCodec, ASTCENC_DEFAULT_VERSION, ASTCENC_DEFAULT_PATH, astc_roundtrip_rgba,
+    resolve_astcenc_executable,
+)
+from Common.Block_Compression.astc import normalize_astc_block
 
 
 def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None, verbose=True,
@@ -61,15 +47,9 @@ def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None,
     def astc_bytes(height, width):
         return math.ceil(height / block_h) * math.ceil(width / block_w) * 16
 
-    latent = uncompressed_latent = 0
-    for index, spec in enumerate(model.feature_grid_specs):
-        channels = spec.n_features_per_level
-        maps = math.ceil(channels / 4)
-        if model.direct_diffuse_enabled and index == 0 and channels >= 3:
-            maps = 1 + math.ceil((channels - 3) / 4)
-        latent += maps * astc_bytes(spec.max_resolution, spec.max_resolution)
-        # model.save exports one RGBA8 DDS per grid, including unused channel padding.
-        uncompressed_latent += spec.max_resolution ** 2 * 4
+    uncompressed_latent = sum(spec.max_resolution**2*4*math.ceil(spec.n_features_per_level/4)
+                              for spec in model.feature_grid_specs)
+    latent = latent_payload_bytes(model, block)
     decoder, cnn = model.decoder_storage_bytes(deployment_config)
     height, width = dataset.texture_height, dataset.texture_width
     ref_h, ref_w = comparison_material_size(model, height, width, ref_astc_resolution)
@@ -78,7 +58,7 @@ def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None,
                    for name in dataset.available_textures)
     rows = (
         ('FNTC', latent + decoder + cnn,
-         f'latent ASTC={latent:,} B + decoder={decoder:,} B + material CNN={cnn:,} B; SR base excluded'),
+         f'latent {getattr(model, "latent_format", "astc").upper()}={latent:,} B + decoder={decoder:,} B + material CNN={cnn:,} B; SR base excluded'),
         ('ASTC', maps * astc_bytes(ref_h, ref_w),
          f'{ref_w}x{ref_h}, {maps} packed maps, {block} blocks'),
         ('GT', height * width * channels,
@@ -91,7 +71,7 @@ def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None,
                   f'| {details}; Mip0 payload only')
     return {
         'fntc_quantized': uncompressed_latent + decoder + cnn,
-        f'fntc_astc_{block}': latent + decoder + cnn,
+        compressed_method(model, block): latent + decoder + cnn,
         f'ref_astc_{block}': maps * astc_bytes(ref_h, ref_w),
         'gt': height * width * channels,
     }
@@ -100,68 +80,6 @@ def log_comparison_storage(model, dataset, block: str, ref_astc_resolution=None,
 # ---------------------------------------------------------------------------
 # Codec + subprocess round-trip
 # ---------------------------------------------------------------------------
-
-@dataclass
-class ASTCCodec:
-    astcenc_path: str
-    astcenc_quality: str
-    astc_block: str = "6x6"
-    _astcenc_executable: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        self.astc_block = normalize_astc_block(self.astc_block)
-
-    def ensure_executable(self) -> str:
-        if self._astcenc_executable is None:
-            self._astcenc_executable = resolve_astcenc_executable(astcenc_path=self.astcenc_path)
-        return self._astcenc_executable
-
-    def roundtrip_rgba(self, rgba: np.ndarray) -> np.ndarray:
-        return astc_roundtrip_rgba(
-            rgba=rgba,
-            astcenc_executable=self.ensure_executable(),
-            astcenc_quality=self.astcenc_quality,
-            astc_block=self.astc_block,
-        )
-
-
-def astc_roundtrip_rgba(
-    rgba: np.ndarray,
-    astcenc_executable: str,
-    astcenc_quality: str,
-    astc_block: str,
-) -> np.ndarray:
-    h, w, c = rgba.shape
-    if c != 4:
-        raise ValueError(f"Expected RGBA input with 4 channels, got {c}.")
-    rgba_u8 = np.asarray(rgba, dtype=np.uint8)
-    block = normalize_astc_block(astc_block)
-
-    with tempfile.TemporaryDirectory(prefix=f"astc_{block}_") as tmp_dir:
-        input_png = os.path.join(tmp_dir, "input_rgba.png")
-        output_astc = os.path.join(tmp_dir, f"output_{block}.astc")
-        output_png = os.path.join(tmp_dir, "output_rgba.png")
-
-        Image.fromarray(rgba_u8).save(input_png)
-        enc_cmd = [astcenc_executable, "-cl", input_png, output_astc, block, f"-{astcenc_quality}"]
-        dec_cmd = [astcenc_executable, "-dl", output_astc, output_png]
-
-        try:
-            subprocess.run(enc_cmd, check=True, capture_output=True, text=True)
-            subprocess.run(dec_cmd, check=True, capture_output=True, text=True)
-        except subprocess.CalledProcessError as exc:
-            stderr_msg = (exc.stderr or "").strip()
-            stdout_msg = (exc.stdout or "").strip()
-            details = stderr_msg if stderr_msg else stdout_msg
-            raise RuntimeError(
-                f"astcenc roundtrip failed with command '{' '.join(exc.cmd)}'. Details: {details}"
-            ) from exc
-
-        decoded = np.array(Image.open(output_png).convert("RGBA"), dtype=np.uint8, copy=True)
-        if decoded.shape[0] != h or decoded.shape[1] != w:
-            decoded = decoded[:h, :w, :]
-        return decoded
-
 
 # ---------------------------------------------------------------------------
 # Tensor ↔ uint8 RGBA (traditional baseline)
@@ -294,6 +212,10 @@ METRIC_FIELDS = ('iteration', 'method', 'view', 'mip', 'group', 'psnr_type',
 
 
 def method_label(method, block=None):
+    if method == 'fntc_mixed':
+        return 'FNTC_mixed'
+    if method == 'fntc_bc1':
+        return 'FNTC_BC1'
     if method == 'fntc_quantized':
         return 'FNTC_uncompressed'
     if method == 'gt':
@@ -562,6 +484,8 @@ def _make_annotated_tile(
 
     if method_name == "fntc_quantized":
         display_name = "FNTC_uncompressed"
+    elif method_name == "fntc_bc1":
+        display_name = "FNTC_BC1"
     elif method_name.startswith("fntc_astc_"):
         display_name = "FNTC_" + method_name.removeprefix("fntc_astc_")
     elif method_name.startswith("ref_astc_"):
@@ -637,7 +561,7 @@ def _save_comparison_strip(
         _concat_pil_h(annotated[1:]).save(os.path.join(compare_root, f"comparison_strip_{vc['display_name']}.png"))
         texture_type = vc.get('texture_type', vc['display_name'])
         texture_prefix = 'Diffuse' if texture_type in ('rgb', 'diffuse') else texture_type.capitalize()
-        names = ("Uncompressed_FNTC", f"FNTC_{fntc_astc_name.removeprefix('fntc_astc_')}",
+        names = ("Uncompressed_FNTC", ("FNTC_mixed" if fntc_astc_name == "fntc_mixed" else "FNTC_BC1" if fntc_astc_name == "fntc_bc1" else f"FNTC_{fntc_astc_name.removeprefix('fntc_astc_')}"),
                  f"ASTC_{ref_astc_name.removeprefix('ref_astc_')}", "GT")
         for name, tile in zip(names, annotated):
             tile.save(os.path.join(compare_root, f"{texture_prefix}_{name}.png"))
@@ -646,110 +570,6 @@ def _save_comparison_strip(
 # ---------------------------------------------------------------------------
 # astcenc discovery / Windows auto-install
 # ---------------------------------------------------------------------------
-
-def resolve_astcenc_executable(astcenc_path: str) -> str:
-    candidate = (astcenc_path or "").strip()
-    if not candidate:
-        raise RuntimeError("Empty astcenc path. Set --astcenc_path.")
-
-    cmd_path = _resolve_candidate_command(candidate)
-    if cmd_path:
-        return cmd_path
-
-    target_path = _to_abs_path(candidate)
-    if os.path.isfile(target_path):
-        return target_path
-
-    if os.path.isdir(target_path):
-        found = _find_astcenc_in_dir(target_path)
-        if found:
-            return found
-        raise FileNotFoundError(f"astcenc directory exists but no executable found: '{target_path}'.")
-
-    install_root = target_path
-    if os.path.splitext(target_path)[1].lower() == ".exe":
-        install_root = os.path.dirname(target_path)
-    os.makedirs(install_root, exist_ok=True)
-    installed = _auto_install_astcenc(ASTCENC_DEFAULT_VERSION, install_root)
-    print(f"[ASTC] Using auto-installed astcenc: {installed}")
-    return installed
-
-
-def _resolve_candidate_command(candidate: str) -> Optional[str]:
-    has_sep = (os.path.sep in candidate) or (os.path.altsep is not None and os.path.altsep in candidate)
-    if os.path.isabs(candidate) or has_sep:
-        abs_path = os.path.abspath(candidate)
-        if os.path.isfile(abs_path):
-            return abs_path
-        return None
-    resolved = shutil.which(candidate)
-    if resolved and os.path.isfile(resolved):
-        return resolved
-    return None
-
-
-def _to_abs_path(candidate: str) -> str:
-    if os.path.isabs(candidate):
-        return os.path.normpath(candidate)
-    return os.path.abspath(os.path.normpath(candidate))
-
-
-def _preferred_astcenc_names():
-    if os.name == "nt":
-        return ["astcenc-avx2.exe", "astcenc-sse4.1.exe", "astcenc-sse2.exe", "astcenc.exe"]
-    return ["astcenc", "astcenc-avx2", "astcenc-sse4.1", "astcenc-sse2", "astcenc-neon"]
-
-
-def _find_astcenc_in_dir(root_dir: str) -> Optional[str]:
-    preferred = _preferred_astcenc_names()
-    preferred_lower = [n.lower() for n in preferred]
-    matches = []
-    for walk_root, _, files in os.walk(root_dir):
-        for fname in files:
-            lower = fname.lower()
-            full_path = os.path.join(walk_root, fname)
-            if lower in preferred_lower:
-                return full_path
-            if lower.startswith("astcenc") and (os.name != "nt" or lower.endswith(".exe")):
-                matches.append(full_path)
-    return sorted(matches)[0] if matches else None
-
-
-def _auto_install_astcenc(version: str, install_root: str) -> str:
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-    if system != "windows" or machine not in {"amd64", "x86_64"}:
-        raise RuntimeError(
-            "Automatic astcenc install currently supports Windows x64 only. "
-            "Please install astcenc manually or set --astcenc_path."
-        )
-
-    asset_name = f"astcenc-{version}-windows-x64.zip"
-    url = f"https://github.com/ARM-software/astc-encoder/releases/download/{version}/{asset_name}"
-
-    os.makedirs(install_root, exist_ok=True)
-    zip_path = os.path.join(install_root, asset_name)
-    extract_dir = os.path.join(install_root, f"astcenc-{version}-windows-x64")
-
-    if not os.path.isfile(zip_path):
-        print(f"[ASTC] Downloading astcenc {version} from {url}")
-        try:
-            urllib.request.urlretrieve(url, zip_path)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to download astcenc from '{url}': {exc}") from exc
-
-    os.makedirs(extract_dir, exist_ok=True)
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(extract_dir)
-    except Exception as exc:
-        raise RuntimeError(f"Failed to extract '{zip_path}': {exc}") from exc
-
-    found = _find_astcenc_in_dir(extract_dir)
-    if found:
-        return found
-    raise RuntimeError(f"Auto-install succeeded but no astcenc executable found in '{extract_dir}'.")
-
 
 # ---------------------------------------------------------------------------
 # Public entry: full pipeline
@@ -780,7 +600,7 @@ def run_astc_comparison_pipeline(
 ) -> Dict[str, Dict[str, Tuple[float, float, float]]]:
     block_tag = astc_codec.astc_block.lower()
     storage = log_comparison_storage(model, dataset, astc_codec.astc_block, ref_astc_resolution, verbose=False)
-    fntc_astc_name = f"fntc_astc_{astc_codec.astc_block}"
+    fntc_astc_name = compressed_method(model, astc_codec.astc_block)
     ref_astc_name = f"ref_astc_{astc_codec.astc_block}"
 
     compare_root = os.path.join(output_root, f"Compare_ASTC{block_tag}")
@@ -823,7 +643,7 @@ def run_astc_comparison_pipeline(
 
     # The uncompressed raster is already materialized; reuse the isolated copy.
     astc_grid_model = quant_model
-    apply_astc_to_feature_grids(astc_grid_model, astc_codec.roundtrip_rgba)
+    apply_latent_compression(astc_grid_model)
     astc_grid_model.eval()
     pred_fntc_grid_astc = _render_model_mip0(
         astc_grid_model, dataset, texture_height, texture_width, num_mips, device,
@@ -854,7 +674,7 @@ def run_astc_comparison_pipeline(
                for row in metric_records(groups, method_label(method), storage_bytes=storage[method],
                                          lpips_available=min(h0, w0) >= 128)]
     write_metrics(compare_root, records, evaluation='astc', iteration=curr_iter,
-                  metadata=dict(report_context or {}, astc_block=astc_codec.astc_block,
+                  metadata=dict(report_context or {}, feature_grid_compression=[r.as_config() for r in grid_recipes(model)], astc_block=astc_codec.astc_block,
                                 gt_size=[h0, w0], inference_size=[ref_h, ref_w],
                                 normal_encoding=dataset.normal_encoding,
                                 group_weights=_group_metric_weights(dataset, eval_weights),
